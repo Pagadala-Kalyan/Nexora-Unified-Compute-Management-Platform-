@@ -1,11 +1,12 @@
-"""Safe Nexora compute provider: executes only allow-listed demonstration workloads."""
-import os, platform, time, threading, subprocess, sys
+"""Nexora provider agent: runs team-submitted Python workloads on this device."""
+import os, platform, time, threading, subprocess, sys, tempfile
 import psutil, requests
 
 BASE=os.getenv("UCMP_BACKEND_URL","http://127.0.0.1:8000").rstrip("/")
 TOKEN=os.getenv("PROVIDER_SHARED_TOKEN","local-demo-token")
 PID=os.getenv("PROVIDER_ID","laptop-001"); NAME=os.getenv("PROVIDER_NAME",platform.node() or "Nexora Provider")
 INTERVAL=int(os.getenv("HEARTBEAT_INTERVAL","5")); HEAD={"X-Provider-Token":TOKEN}
+active_jobs=0
 def request(method,path,**kwargs): return requests.request(method,BASE+path,headers=HEAD,timeout=10,**kwargs)
 def utilization(): return {"cpu":psutil.cpu_percent(),"ram":psutil.virtual_memory().percent,"gpu":0,"disk":psutil.disk_usage('/').percent}
 def register():
@@ -13,17 +14,19 @@ def register():
     request("POST","/providers/register",json=data).raise_for_status(); print(f"Connected as {NAME} ({PID})")
 def heartbeat():
     while True:
-        try: request("POST",f"/providers/{PID}/heartbeat",json={"status":"ONLINE","utilization":utilization()}).raise_for_status()
+        try: request("POST",f"/providers/{PID}/heartbeat",json={"status":"BUSY" if active_jobs else "ONLINE","utilization":utilization()}).raise_for_status()
         except requests.RequestException as e: print(f"heartbeat failed: {e}")
         time.sleep(INTERVAL)
 def execute(job):
-    jid=job["id"]; request("POST",f"/providers/jobs/{jid}/update",json={"status":"RUNNING","progress":0})
+    global active_jobs
+    jid=job["id"]; active_jobs+=1; request("POST",f"/providers/jobs/{jid}/update",json={"status":"RUNNING","progress":0})
     try:
         workload=job["workload"]
         size=min(max(int(job["requirements"].get("matrix_size",300)),10),1200)
         total=0
         resume_at=int(job["requirements"].get("resume_from_progress",0))
-        for progress in range(resume_at+10,101,10):
+        checkpoint_start=((resume_at // 25) + 1) * 25
+        for progress in range(checkpoint_start,101,25):
             if workload == "matrix_multiply": total=sum((i*i)%97 for i in range(size*20))
             elif workload == "prime_search": total=sum(1 for n in range(2,size*20) if all(n%d for d in range(2,int(n**.5)+1)))
             elif workload == "fibonacci":
@@ -33,17 +36,23 @@ def execute(job):
             elif workload == "custom_python":
                 code=job["requirements"].get("python_code","")
                 if not code.strip(): raise ValueError("No Python code was supplied")
-                process=subprocess.run([sys.executable,"-I","-c",code],capture_output=True,text=True,timeout=int(job["requirements"].get("timeout_seconds",20)))
+                filename=job["requirements"].get("file_name","nexora_workload.py")
+                with tempfile.TemporaryDirectory(prefix="nexora-job-") as workdir:
+                    source=os.path.join(workdir, os.path.basename(filename))
+                    with open(source,"w",encoding="utf-8") as submitted: submitted.write(code)
+                    process=subprocess.run([sys.executable,"-I",source],capture_output=True,text=True,timeout=int(job["requirements"].get("timeout_seconds",20)),cwd=workdir)
                 if process.returncode: raise RuntimeError(process.stderr[-1500:] or "Python workload failed")
                 total=process.stdout[-4000:]
             request("POST",f"/providers/jobs/{jid}/update",json={"progress":progress})
-            if progress in (50,): request("POST",f"/providers/jobs/{jid}/checkpoint",json={"progress":progress,"state":{"iteration":progress,"safe_workload":job["workload"]}})
+            if progress in (25,50,75,100): request("POST",f"/providers/jobs/{jid}/checkpoint",json={"progress":progress,"state":{"iteration":progress,"workload":job["workload"],"provider":PID}})
             time.sleep(.35)
         message={"matrix_multiply":"Matrix computation completed","prime_search":"Prime search completed","fibonacci":"Fibonacci computation completed","custom_python":"Uploaded Python code completed"}.get(workload,"Workload completed")
         request("POST",f"/providers/jobs/{jid}/update",json={"status":"COMPLETED","progress":100,"actual_cost":round(.15/3600*4,5),"result":{"message":message,"workload":workload,"input_size":size,"output":total,"provider":PID}})
         print(f"completed {jid}")
     except Exception as e:
         request("POST",f"/providers/jobs/{jid}/update",json={"status":"FAILED","result":{"error":str(e)}})
+    finally:
+        active_jobs=max(0,active_jobs-1)
 def listener():
     while True:
         try:
@@ -51,5 +60,5 @@ def listener():
         except requests.RequestException as e: print(f"poll failed: {e}")
         time.sleep(2)
 if __name__=="__main__":
-    print("Nexora Provider Server — safe controlled workloads only")
+    print("Nexora Provider Server — executing workloads on this provider device")
     register(); threading.Thread(target=heartbeat,daemon=True).start(); listener()
