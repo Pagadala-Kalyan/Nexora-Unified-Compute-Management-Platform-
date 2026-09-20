@@ -168,7 +168,14 @@ def stop_all_jobs(u:User=Depends(current_user),s:Session=Depends(db)):
     for j in jobs: j.status="CANCELLED";j.completed_at=datetime.now(timezone.utc)
     s.commit();return {"cancelled":len(jobs)}
 @app.get("/providers/{provider_id}/jobs/pending")
-def pending(provider_id:str,_=Depends(provider_auth),s:Session=Depends(db)): return [job_data(j) for j in s.query(Job).filter(Job.provider_id==provider_id,Job.status.in_(["SCHEDULED","RECOVERING"])).all()]
+def pending(provider_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
+    queued=[]
+    for job in s.query(Job).filter(Job.provider_id==provider_id,Job.status.in_(["SCHEDULED","RECOVERING"])).all():
+        payload=job_data(job)
+        owner=s.get(User,job.user_id)
+        payload["submitted_by"]=owner.email if owner else "unknown user"
+        queued.append(payload)
+    return queued
 @app.post("/providers/jobs/{job_id}/update")
 def update_job(job_id:str,body:Update,_=Depends(provider_auth),s:Session=Depends(db)):
     j=s.get(Job,job_id)

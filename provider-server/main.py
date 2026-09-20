@@ -19,7 +19,9 @@ def heartbeat():
         time.sleep(INTERVAL)
 def execute(job):
     global active_jobs
-    jid=job["id"]; active_jobs+=1; request("POST",f"/providers/jobs/{jid}/update",json={"status":"RUNNING","progress":0})
+    jid=job["id"]; active_jobs+=1
+    print(f"\n[JOB RECEIVED] {jid} | type: {job['workload']} | submitted by: {job.get('submitted_by','unknown user')}")
+    request("POST",f"/providers/jobs/{jid}/update",json={"status":"RUNNING","progress":0})
     try:
         workload=job["workload"]
         size=min(max(int(job["requirements"].get("matrix_size",300)),10),1200)
@@ -48,8 +50,9 @@ def execute(job):
             time.sleep(.35)
         message={"matrix_multiply":"Matrix computation completed","prime_search":"Prime search completed","fibonacci":"Fibonacci computation completed","custom_python":"Uploaded Python code completed"}.get(workload,"Workload completed")
         request("POST",f"/providers/jobs/{jid}/update",json={"status":"COMPLETED","progress":100,"actual_cost":round(.15/3600*4,5),"result":{"message":message,"workload":workload,"input_size":size,"output":total,"provider":PID}})
-        print(f"completed {jid}")
+        print(f"[JOB COMPLETED] {jid} | output:\n{total}\n")
     except Exception as e:
+        print(f"[JOB FAILED] {jid} | error: {e}\n")
         request("POST",f"/providers/jobs/{jid}/update",json={"status":"FAILED","result":{"error":str(e)}})
     finally:
         active_jobs=max(0,active_jobs-1)
