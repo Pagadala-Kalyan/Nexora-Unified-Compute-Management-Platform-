@@ -98,6 +98,8 @@ def recover_lost_providers():
         try:
             now=datetime.now(timezone.utc)
             for failed in s.query(Provider).filter(Provider.status.in_(["ONLINE","BUSY","AVAILABLE"])).all():
+                if failed.id.startswith("nexora-demo-"):
+                    continue
                 last=failed.last_heartbeat if failed.last_heartbeat.tzinfo else failed.last_heartbeat.replace(tzinfo=timezone.utc)
                 if (now-last).total_seconds() <= int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS","20")): continue
                 failed.status="OFFLINE"
@@ -111,10 +113,41 @@ def recover_lost_providers():
             s.commit()
         finally: s.close()
 
+def run_demo_jobs():
+    """Keep the public project demonstrable when no team laptop agent is online."""
+    while True:
+        time.sleep(2)
+        s=SessionLocal()
+        try:
+            for job in s.query(Job).filter(Job.provider_id.like("nexora-demo-%"), Job.status.in_(["SCHEDULED", "RUNNING"])).all():
+                job.status="RUNNING"
+                job.started_at=job.started_at or datetime.now(timezone.utc)
+                job.progress=min(100, job.progress+50)
+                if job.progress == 100:
+                    job.status="COMPLETED"; job.completed_at=datetime.now(timezone.utc)
+                    job.actual_cost=round(job.estimated_cost, 4)
+                    job.result={"message":"Completed on Nexora hosted demo runner", "workload":job.workload, "size":job.requirements.get("size", job.requirements.get("matrix_size"))}
+                    provider=s.get(Provider,job.provider_id)
+                    if provider: provider.status="ONLINE"
+            s.commit()
+        finally: s.close()
+
 @app.on_event("startup")
 def init():
     Base.metadata.create_all(engine)
+    s=SessionLocal()
+    try:
+        for provider in [
+            {"id":"nexora-demo-cpu-1","name":"Nexora Demo CPU Runner","cpu_cores":8,"ram_gb":16,"cost_per_hour":0.04},
+            {"id":"nexora-demo-cpu-2","name":"Nexora Demo Compute Runner","cpu_cores":8,"ram_gb":16,"cost_per_hour":0.05},
+        ]:
+            p=s.get(Provider, provider["id"])
+            if not p: s.add(Provider(**provider, status="ONLINE", reliability=100, utilization={"cpu":12,"ram":24,"gpu":0}))
+            else: p.status="ONLINE"; p.last_heartbeat=datetime.now(timezone.utc)
+        s.commit()
+    finally: s.close()
     threading.Thread(target=recover_lost_providers,daemon=True,name="provider-recovery-monitor").start()
+    threading.Thread(target=run_demo_jobs,daemon=True,name="hosted-demo-runner").start()
 @app.get("/health")
 def health(): return {"status":"ok","service":"nexora-control-plane"}
 @app.get("/", include_in_schema=False)
