@@ -1,3 +1,5 @@
+// Local runs use FastAPI on port 8000. Hosted deployments should set
+// VITE_API_URL to the separately deployed Nexora control-plane URL.
 const base=import.meta.env.VITE_API_URL||'http://localhost:8000';
 let token=localStorage.getItem('nexora_token');
 export function setToken(v){token=v; localStorage.setItem('nexora_token',v)}

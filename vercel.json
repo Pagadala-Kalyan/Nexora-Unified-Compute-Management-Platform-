@@ -1,0 +1,7 @@
+{
+  "framework": null,
+  "installCommand": "cd user-website/frontend-vite-backup && npm install",
+  "buildCommand": "cd user-website/frontend-vite-backup && npm run build",
+  "outputDirectory": "user-website/frontend-vite-backup/dist",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}
