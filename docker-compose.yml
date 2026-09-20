@@ -1,0 +1,18 @@
+services:
+  backend:
+    build: ./user-website/backend
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://nexora:nexora@db:5432/nexora
+      JWT_SECRET: ${JWT_SECRET:-change-me-before-production}
+      PROVIDER_SHARED_TOKEN: ${PROVIDER_SHARED_TOKEN:-local-demo-token}
+    depends_on: [db]
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nexora
+      POSTGRES_USER: nexora
+      POSTGRES_PASSWORD: nexora
+    volumes: [postgres-data:/var/lib/postgresql/data]
+volumes:
+  postgres-data:
