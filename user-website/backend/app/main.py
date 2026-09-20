@@ -67,7 +67,7 @@ class DemoTopUp(BaseModel): amount: float = Field(gt=0, le=10000); card_number: 
 app=FastAPI(title="Nexora UCMP Control Plane", version="0.1.0")
 # Allow any local development port (Vite/Next commonly choose a different port
 # when one is occupied) while keeping remote browser origins explicitly blocked.
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000").split(","), allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX", r"https?://(localhost|127\.0\.0\.1)(:\d+)?"), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000").split(","), allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX", r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.vercel\.app"), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 # The Vite dashboard remains the currently served app while the exact Next.js
 # authentication template is prepared in user-website/frontend-next.
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend-vite-backup" / "dist"
