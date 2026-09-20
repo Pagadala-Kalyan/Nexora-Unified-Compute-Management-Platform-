@@ -30,3 +30,5 @@ Vercel is configured to build the static dashboard from `user-website/frontend-v
 ## Public backend deployment with Render
 
 The repository includes `render.yaml` to create a Render web service and PostgreSQL database. In Render, choose **New → Blueprint**, select this repository, and deploy `nexora-control-plane`. Once it reports healthy, copy its `https://...onrender.com` URL into Vercel as `VITE_API_URL`, then redeploy Vercel. Set the same URL in the provider machine's `UCMP_BACKEND_URL` and copy Render's generated `PROVIDER_SHARED_TOKEN` into that machine's environment.
+
+If the Render service is configured as Docker instead of a Blueprint, the root `Dockerfile` runs the same FastAPI control plane automatically.
