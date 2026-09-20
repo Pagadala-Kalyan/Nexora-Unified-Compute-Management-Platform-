@@ -26,3 +26,7 @@ See [architecture.md](docs/architecture.md) and [api.md](docs/api.md) for the ex
 ## Vercel dashboard deployment
 
 Vercel is configured to build the static dashboard from `user-website/frontend-vite-backup`. Set `VITE_API_URL` in the Vercel project environment to the public URL of a separately deployed Nexora FastAPI control plane. The provider agent must also point `UCMP_BACKEND_URL` to that same control-plane URL; it cannot connect to a static Vercel dashboard.
+
+## Public backend deployment with Render
+
+The repository includes `render.yaml` to create a Render web service and PostgreSQL database. In Render, choose **New → Blueprint**, select this repository, and deploy `nexora-control-plane`. Once it reports healthy, copy its `https://...onrender.com` URL into Vercel as `VITE_API_URL`, then redeploy Vercel. Set the same URL in the provider machine's `UCMP_BACKEND_URL` and copy Render's generated `PROVIDER_SHARED_TOKEN` into that machine's environment.
