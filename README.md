@@ -27,6 +27,8 @@ For a LAN demonstration, run the backend with host `0.0.0.0`, allow port 8000 in
 
 See [architecture.md](docs/architecture.md) and [api.md](docs/api.md) for the execution flow and API contract.
 
+To let users on any device open the deployed Vercel dashboard while retaining the provider and SQLite database on your laptop, follow [remote-local-access.md](docs/remote-local-access.md).
+
 ## Vercel dashboard deployment
 
 Vercel is configured to build the static dashboard from `user-website/frontend-vite-backup`. Set `VITE_API_URL` in the Vercel project environment to the public URL of a separately deployed Nexora FastAPI control plane. The provider agent must also point `UCMP_BACKEND_URL` to that same control-plane URL; it cannot connect to a static Vercel dashboard.
