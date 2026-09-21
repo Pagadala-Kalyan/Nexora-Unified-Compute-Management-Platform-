@@ -21,19 +21,22 @@ def execute(job):
     global active_jobs
     jid=job["id"]; active_jobs+=1
     print(f"\n[JOB RECEIVED] {jid} | type: {job['workload']} | submitted by: {job.get('submitted_by','unknown user')}")
-    request("POST",f"/providers/jobs/{jid}/update",json={"status":"RUNNING","progress":0})
+    started_at=time.perf_counter(); request("POST",f"/providers/jobs/{jid}/update",json={"status":"RUNNING","progress":0})
     try:
         workload=job["workload"]
         size=min(max(int(job["requirements"].get("matrix_size",300)),10),1200)
-        total=0
+        total=0; a,b=0,1
         resume_at=int(job["requirements"].get("resume_from_progress",0))
         checkpoint_start=((resume_at // 25) + 1) * 25
-        for progress in range(checkpoint_start,101,25):
-            if workload == "matrix_multiply": total=sum((i*i)%97 for i in range(size*20))
-            elif workload == "prime_search": total=sum(1 for n in range(2,size*20) if all(n%d for d in range(2,int(n**.5)+1)))
+        steps=range(checkpoint_start,101,25) if workload != "custom_python" else (100,)
+        for progress in steps:
+            # Each checkpoint follows work actually completed on this device.
+            start=max(0,((progress-25)*size*20)//100); end=(progress*size*20)//100
+            if workload == "matrix_multiply": total+=sum((i*i)%97 for i in range(start,end))
+            elif workload == "prime_search": total+=sum(1 for n in range(max(2,start),max(2,end)) if all(n%d for d in range(2,int(n**.5)+1)))
             elif workload == "fibonacci":
-                a,b=0,1
-                for _ in range(size*100): a,b=b,a+b
+                start=max(0,((progress-25)*size*100)//100); end=(progress*size*100)//100
+                for _ in range(start,end): a,b=b,a+b
                 total=len(str(a))
             elif workload == "custom_python":
                 code=job["requirements"].get("python_code","")
@@ -46,10 +49,10 @@ def execute(job):
                 if process.returncode: raise RuntimeError(process.stderr[-1500:] or "Python workload failed")
                 total=process.stdout[-4000:]
             request("POST",f"/providers/jobs/{jid}/update",json={"progress":progress})
-            if progress in (25,50,75,100): request("POST",f"/providers/jobs/{jid}/checkpoint",json={"progress":progress,"state":{"iteration":progress,"workload":job["workload"],"provider":PID}})
-            time.sleep(.35)
+            if progress in (25,50,75,100): request("POST",f"/providers/jobs/{jid}/checkpoint",json={"progress":progress,"state":{"iteration":progress,"workload":job["workload"],"provider":PID,"elapsed_seconds":round(time.perf_counter()-started_at,4)}})
         message={"matrix_multiply":"Matrix computation completed","prime_search":"Prime search completed","fibonacci":"Fibonacci computation completed","custom_python":"Uploaded Python code completed"}.get(workload,"Workload completed")
-        request("POST",f"/providers/jobs/{jid}/update",json={"status":"COMPLETED","progress":100,"actual_cost":round(.15/3600*4,5),"result":{"message":message,"workload":workload,"input_size":size,"output":total,"provider":PID}})
+        elapsed=round(time.perf_counter()-started_at,4)
+        request("POST",f"/providers/jobs/{jid}/update",json={"status":"COMPLETED","progress":100,"actual_cost":round(.15/3600*elapsed,5),"result":{"message":message,"workload":workload,"input_size":size,"output":total,"provider":PID,"elapsed_seconds":elapsed}})
         print(f"[JOB COMPLETED] {jid} | output:\n{total}\n")
     except Exception as e:
         print(f"[JOB FAILED] {jid} | error: {e}\n")
