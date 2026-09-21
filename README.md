@@ -13,6 +13,8 @@ Nexora is a functional distributed-compute prototype: the web control plane sche
 - Result reporting, provider release, dashboard polling, job history, and basic analytics
 - Local SQLite persistence for accounts, password hashes, sessions, providers, telemetry, jobs, submitted source, checkpoints, and results
 
+The complete local relational model is documented in [database-schema.md](docs/database-schema.md).
+
 ## Quick local demonstration
 
 1. Create and activate a Python virtual environment in `user-website/backend`, then install `requirements.txt`.

@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, create_engine
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nexora.db")
@@ -55,6 +55,22 @@ class Job(Base):
     estimated_cost: Mapped[float]=mapped_column(Float, default=0); actual_cost: Mapped[float]=mapped_column(Float, default=0); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)); started_at: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True); completed_at: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True)
 class Checkpoint(Base):
     __tablename__="checkpoints"; id: Mapped[str]=mapped_column(String, primary_key=True); job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id")); provider_id: Mapped[str]=mapped_column(String); progress: Mapped[int]=mapped_column(Integer); payload: Mapped[dict]=mapped_column(JSON, default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+class AuthSession(Base):
+    __tablename__="auth_sessions"
+    id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True)
+    issued_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)); expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True)); revoked: Mapped[bool]=mapped_column(Boolean, default=False)
+class JobArtifact(Base):
+    __tablename__="job_artifacts"
+    id: Mapped[str]=mapped_column(String, primary_key=True); job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id"), index=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True)
+    filename: Mapped[str]=mapped_column(String); media_type: Mapped[str]=mapped_column(String, default="text/x-python"); content: Mapped[str]=mapped_column(Text); size_bytes: Mapped[int]=mapped_column(Integer); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+class BillingTransaction(Base):
+    __tablename__="billing_transactions"
+    id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True)
+    kind: Mapped[str]=mapped_column(String); amount: Mapped[float]=mapped_column(Float); reference: Mapped[str]=mapped_column(String); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+class AuditEvent(Base):
+    __tablename__="audit_events"
+    id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True, index=True); provider_id: Mapped[Optional[str]]=mapped_column(ForeignKey("providers.id"), nullable=True, index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    event_type: Mapped[str]=mapped_column(String); details: Mapped[dict]=mapped_column(JSON, default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Register(BaseModel): email: str; password: str = Field(min_length=8)
 class Login(Register): pass
@@ -77,9 +93,18 @@ def db():
     s=SessionLocal()
     try: yield s
     finally: s.close()
-def token_for(user: User): return jwt.encode({"sub":str(user.id),"email":user.email,"exp":datetime.now(timezone.utc)+timedelta(hours=12)},JWT_SECRET,algorithm="HS256")
+def add_audit(s, event_type, user_id=None, provider_id=None, job_id=None, details=None):
+    s.add(AuditEvent(id=f"audit_{secrets.token_hex(8)}",event_type=event_type,user_id=user_id,provider_id=provider_id,job_id=job_id,details=details or {}))
+def token_for(user: User, session_id: str, expires_at: datetime): return jwt.encode({"sub":str(user.id),"sid":session_id,"email":user.email,"exp":expires_at},JWT_SECRET,algorithm="HS256")
+def session_response(s: Session, user: User):
+    expiry=datetime.now(timezone.utc)+timedelta(hours=12); session_id=f"ses_{secrets.token_hex(16)}"
+    s.add(AuthSession(id=session_id,user_id=user.id,expires_at=expiry)); add_audit(s,"auth.session_created",user_id=user.id); s.commit()
+    return {"access_token":token_for(user,session_id,expiry),"user":{"id":user.id,"email":user.email,"wallet_balance":user.wallet_balance}}
 def current_user(authorization: str=Header(...), s:Session=Depends(db)):
-    try: user=s.get(User,int(jwt.decode(authorization.removeprefix("Bearer "),JWT_SECRET,algorithms=["HS256"])["sub"]))
+    try:
+        payload=jwt.decode(authorization.removeprefix("Bearer "),JWT_SECRET,algorithms=["HS256"]); session=s.get(AuthSession,payload["sid"])
+        if not session or session.revoked or session.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc): raise ValueError("Session expired")
+        user=s.get(User,int(payload["sub"]))
     except Exception: raise HTTPException(401,"Invalid or expired session")
     if not user: raise HTTPException(401,"User not found")
     return user
@@ -124,12 +149,12 @@ def dashboard_app():
 @app.post("/auth/register")
 def register(body:Register,s:Session=Depends(db)):
     if s.query(User).filter_by(email=body.email.lower()).first(): raise HTTPException(409,"Email already registered")
-    u=User(email=body.email.lower(),password_hash=hash_password(body.password));s.add(u);s.commit();s.refresh(u);return {"access_token":token_for(u),"user":{"id":u.id,"email":u.email,"wallet_balance":u.wallet_balance}}
+    u=User(email=body.email.lower(),password_hash=hash_password(body.password));s.add(u);s.commit();s.refresh(u);add_audit(s,"auth.account_created",user_id=u.id);return session_response(s,u)
 @app.post("/auth/login")
 def login(body:Login,s:Session=Depends(db)):
     u=s.query(User).filter_by(email=body.email.lower()).first()
     if not u or not verify_password(body.password,u.password_hash): raise HTTPException(401,"Incorrect email or password")
-    return {"access_token":token_for(u),"user":{"id":u.id,"email":u.email,"wallet_balance":u.wallet_balance}}
+    return session_response(s,u)
 @app.get("/providers")
 def providers(_:User=Depends(current_user),s:Session=Depends(db)): return [provider_data(p) for p in s.query(Provider).all()]
 @app.post("/providers/register")
@@ -151,7 +176,10 @@ def jobs(u:User=Depends(current_user),s:Session=Depends(db)): return [job_data(j
 def create_job(body:JobCreate,u:User=Depends(current_user),s:Session=Depends(db)):
     p=compatible_provider(s,body.requirements)
     if not p: raise HTTPException(409,"No compatible online provider is available")
-    j=Job(id=f"job_{secrets.token_hex(5)}",name=body.name,workload=body.workload,requirements=body.requirements,user_id=u.id,provider_id=p.id,status="SCHEDULED",estimated_cost=round(p.cost_per_hour*body.requirements.get("expected_runtime_hours",.05),4));p.status="BUSY";s.add(j);s.commit();return job_data(j)
+    j=Job(id=f"job_{secrets.token_hex(5)}",name=body.name,workload=body.workload,requirements=body.requirements,user_id=u.id,provider_id=p.id,status="SCHEDULED",estimated_cost=round(p.cost_per_hour*body.requirements.get("expected_runtime_hours",.05),4));p.status="BUSY";s.add(j)
+    source=body.requirements.get("python_code","")
+    if source.strip(): s.add(JobArtifact(id=f"art_{secrets.token_hex(8)}",job_id=j.id,user_id=u.id,filename=body.requirements.get("file_name",f"{j.name}.py"),content=source,size_bytes=len(source.encode("utf-8"))))
+    add_audit(s,"job.submitted",user_id=u.id,provider_id=p.id,job_id=j.id,details={"workload":body.workload});s.commit();return job_data(j)
 @app.get("/jobs/{job_id}")
 def get_job(job_id:str,u:User=Depends(current_user),s:Session=Depends(db)):
     j=s.get(Job,job_id)
@@ -213,5 +241,5 @@ def demo_topup(body:DemoTopUp,u:User=Depends(current_user),s:Session=Depends(db)
     # College-project demo only: card data is validated for form completeness and never stored or transmitted.
     digits="".join(ch for ch in body.card_number if ch.isdigit())
     if len(digits) < 12: raise HTTPException(422,"Enter a valid test card number")
-    u.wallet_balance=round(u.wallet_balance+body.amount,2);s.commit()
+    u.wallet_balance=round(u.wallet_balance+body.amount,2);s.add(BillingTransaction(id=f"txn_{secrets.token_hex(8)}",user_id=u.id,kind="demo_topup",amount=body.amount,reference=f"demo-card-{digits[-4:]}"));add_audit(s,"billing.demo_topup",user_id=u.id,details={"amount":body.amount});s.commit()
     return {"wallet_balance":u.wallet_balance,"credited":body.amount,"card_last4":digits[-4:],"mode":"demo"}
