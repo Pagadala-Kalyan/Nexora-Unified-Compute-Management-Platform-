@@ -23,6 +23,8 @@ if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 JWT_SECRET = os.getenv("JWT_SECRET", "development-only-change-me")
 PROVIDER_TOKEN = os.getenv("PROVIDER_SHARED_TOKEN", "local-demo-token")
+TOKEN_PACKAGES=[{"id":"starter","price":10,"tokens":100},{"id":"standard","price":25,"tokens":300},{"id":"compute","price":50,"tokens":700}]
+LOW_TOKEN_THRESHOLD=int(os.getenv("LOW_TOKEN_THRESHOLD","100"))
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, autoflush=False)
 def hash_password(password: str) -> str:
@@ -67,6 +69,17 @@ class BillingTransaction(Base):
     __tablename__="billing_transactions"
     id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True)
     kind: Mapped[str]=mapped_column(String); amount: Mapped[float]=mapped_column(Float); reference: Mapped[str]=mapped_column(String); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+class Wallet(Base):
+    __tablename__="wallets"
+    id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    token_balance: Mapped[int]=mapped_column(Integer, default=1000); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+class TokenTransaction(Base):
+    __tablename__="token_transactions"
+    id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True); wallet_id: Mapped[str]=mapped_column(ForeignKey("wallets.id"), index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True)
+    type: Mapped[str]=mapped_column(String); amount: Mapped[int]=mapped_column(Integer); balance_before: Mapped[int]=mapped_column(Integer); balance_after: Mapped[int]=mapped_column(Integer); reference_type: Mapped[str]=mapped_column(String); reference_id: Mapped[Optional[str]]=mapped_column(String, nullable=True); description: Mapped[str]=mapped_column(String); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+class JobBilling(Base):
+    __tablename__="job_billing"
+    job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id"), primary_key=True); estimated_tokens: Mapped[int]=mapped_column(Integer); reserved_tokens: Mapped[int]=mapped_column(Integer); actual_tokens: Mapped[Optional[int]]=mapped_column(Integer, nullable=True)
 class AuditEvent(Base):
     __tablename__="audit_events"
     id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True, index=True); provider_id: Mapped[Optional[str]]=mapped_column(ForeignKey("providers.id"), nullable=True, index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
@@ -79,6 +92,7 @@ class ProviderRegister(BaseModel): id: str; name: str; cpu_cores: int = Field(ge
 class Heartbeat(BaseModel): status: str="ONLINE"; utilization: dict=Field(default_factory=dict)
 class Update(BaseModel): status: Optional[JobStatus]=None; progress: Optional[int]=Field(None, ge=0, le=100); result: Optional[dict]=None; actual_cost: Optional[float]=None
 class DemoTopUp(BaseModel): amount: float = Field(gt=0, le=10000); card_number: str = Field(min_length=12, max_length=23); cardholder: str = Field(min_length=2, max_length=80); expiry: str = Field(min_length=4, max_length=7); cvc: str = Field(min_length=3, max_length=4)
+class TokenPurchase(BaseModel): package_id: str
 
 app=FastAPI(title="Nexora UCMP Control Plane", version="0.1.0")
 # Allow any local development port (Vite/Next commonly choose a different port
@@ -95,11 +109,34 @@ def db():
     finally: s.close()
 def add_audit(s, event_type, user_id=None, provider_id=None, job_id=None, details=None):
     s.add(AuditEvent(id=f"audit_{secrets.token_hex(8)}",event_type=event_type,user_id=user_id,provider_id=provider_id,job_id=job_id,details=details or {}))
+def wallet_for(s, user_id):
+    wallet=s.query(Wallet).filter_by(user_id=user_id).first()
+    if not wallet:
+        wallet=Wallet(id=f"wal_{secrets.token_hex(8)}",user_id=user_id,token_balance=0);s.add(wallet);s.flush()
+        token_ledger(s,wallet,"ADJUSTMENT",1000,"MIGRATION",None,"Initial Nexora compute tokens")
+    return wallet
+def token_ledger(s,wallet,kind,amount,reference_type,reference_id,description,job_id=None):
+    before=wallet.token_balance; after=before+amount
+    if after<0: raise HTTPException(402,detail={"message":"Insufficient token balance","required":-amount,"available":before})
+    wallet.token_balance=after
+    s.add(TokenTransaction(id=f"tok_{secrets.token_hex(8)}",user_id=wallet.user_id,wallet_id=wallet.id,job_id=job_id,type=kind,amount=amount,balance_before=before,balance_after=after,reference_type=reference_type,reference_id=reference_id,description=description))
+    return after
+def estimate_tokens(requirements, provider):
+    hours=max(float(requirements.get("expected_runtime_hours",.05)),.01)
+    multiplier=8 if requirements.get("gpu_required") or requirements.get("workload_type")=="gpu" else 2
+    if requirements.get("python_code") and "torch" in requirements["python_code"]: multiplier=10
+    return max(1, int(round(hours*60*multiplier + max(0,provider.ram_gb-4)*.1)))
+def refund_reservation(s, job, reason):
+    bill=s.get(JobBilling,job.id)
+    if bill and bill.reserved_tokens:
+        wallet=wallet_for(s,job.user_id); amount=bill.reserved_tokens;bill.reserved_tokens=0
+        token_ledger(s,wallet,"JOB_REFUND",amount,"JOB",job.id,reason,job.id)
 def token_for(user: User, session_id: str, expires_at: datetime): return jwt.encode({"sub":str(user.id),"sid":session_id,"email":user.email,"exp":expires_at},JWT_SECRET,algorithm="HS256")
 def session_response(s: Session, user: User):
     expiry=datetime.now(timezone.utc)+timedelta(hours=12); session_id=f"ses_{secrets.token_hex(16)}"
     s.add(AuthSession(id=session_id,user_id=user.id,expires_at=expiry)); add_audit(s,"auth.session_created",user_id=user.id); s.commit()
-    return {"access_token":token_for(user,session_id,expiry),"user":{"id":user.id,"email":user.email,"wallet_balance":user.wallet_balance}}
+    wallet=wallet_for(s,user.id);s.commit()
+    return {"access_token":token_for(user,session_id,expiry),"user":{"id":user.id,"email":user.email,"token_balance":wallet.token_balance}}
 def current_user(authorization: str=Header(...), s:Session=Depends(db)):
     try:
         payload=jwt.decode(authorization.removeprefix("Bearer "),JWT_SECRET,algorithms=["HS256"]); session=s.get(AuthSession,payload["sid"])
@@ -110,7 +147,9 @@ def current_user(authorization: str=Header(...), s:Session=Depends(db)):
     return user
 def provider_auth(x_provider_token: str=Header(...)):
     if not secrets.compare_digest(x_provider_token, PROVIDER_TOKEN): raise HTTPException(401,"Provider authentication failed")
-def job_data(j): return {"id":j.id,"name":j.name,"workload":j.workload,"requirements":j.requirements,"status":j.status,"progress":j.progress,"provider_id":j.provider_id,"result":j.result,"estimated_cost":j.estimated_cost,"actual_cost":j.actual_cost,"created_at":j.created_at}
+def job_data(j, s=None):
+    bill=s.get(JobBilling,j.id) if s else None
+    return {"id":j.id,"name":j.name,"workload":j.workload,"requirements":j.requirements,"status":j.status,"progress":j.progress,"provider_id":j.provider_id,"result":j.result,"estimated_cost":j.estimated_cost,"actual_cost":j.actual_cost,"estimated_tokens":bill.estimated_tokens if bill else 0,"reserved_tokens":bill.reserved_tokens if bill else 0,"actual_tokens":bill.actual_tokens if bill else None,"created_at":j.created_at}
 def provider_data(p): return {"id":p.id,"name":p.name,"cpu_cores":p.cpu_cores,"ram_gb":p.ram_gb,"gpu_name":p.gpu_name,"gpu_memory_gb":p.gpu_memory_gb,"cost_per_hour":p.cost_per_hour,"status":p.status,"reliability":p.reliability,"utilization":p.utilization,"last_heartbeat":p.last_heartbeat}
 def compatible_provider(s, requirements, exclude_id=None):
     candidates=[p for p in s.query(Provider).all() if p.id!=exclude_id and p.status in ("ONLINE","AVAILABLE") and p.cpu_cores>=requirements.get("cpu_cores",1) and p.ram_gb>=requirements.get("ram_gb",1) and (not requirements.get("gpu_required") or p.gpu_name)]
@@ -132,13 +171,19 @@ def recover_lost_providers():
                     if checkpoint and replacement:
                         j.provider_id=replacement.id; j.status="RECOVERING"; j.progress=checkpoint.progress
                         j.requirements={**j.requirements,"resume_from_progress":checkpoint.progress,"recovery_note":f"Recovered from {failed.name}"}; replacement.status="BUSY"
-                    else: j.status="FAILED"; j.result={"error":"Provider lost; no compatible recovery provider or checkpoint available."}
+                    else:
+                        j.status="FAILED"; j.result={"error":"Provider lost; no compatible recovery provider or checkpoint available."}; refund_reservation(s,j,f"Refund after provider loss for {j.name}")
             s.commit()
         finally: s.close()
 
 @app.on_event("startup")
 def init():
     Base.metadata.create_all(engine)
+    s=SessionLocal()
+    try:
+        for user in s.query(User).all(): wallet_for(s,user.id)
+        s.commit()
+    finally: s.close()
     threading.Thread(target=recover_lost_providers,daemon=True,name="provider-recovery-monitor").start()
 @app.get("/health")
 def health(): return {"status":"ok","service":"nexora-control-plane"}
@@ -171,25 +216,29 @@ def heartbeat(provider_id:str,body:Heartbeat,_=Depends(provider_auth),s:Session=
     if not p: raise HTTPException(404,"Provider not registered")
     p.status=body.status;p.utilization=body.utilization;p.last_heartbeat=datetime.now(timezone.utc);s.commit();return {"ok":True}
 @app.get("/jobs")
-def jobs(u:User=Depends(current_user),s:Session=Depends(db)): return [job_data(j) for j in s.query(Job).filter_by(user_id=u.id).order_by(Job.created_at.desc()).all()]
+def jobs(u:User=Depends(current_user),s:Session=Depends(db)): return [job_data(j,s) for j in s.query(Job).filter_by(user_id=u.id).order_by(Job.created_at.desc()).all()]
 @app.post("/jobs")
 def create_job(body:JobCreate,u:User=Depends(current_user),s:Session=Depends(db)):
     p=compatible_provider(s,body.requirements)
     if not p: raise HTTPException(409,"No compatible online provider is available")
-    j=Job(id=f"job_{secrets.token_hex(5)}",name=body.name,workload=body.workload,requirements=body.requirements,user_id=u.id,provider_id=p.id,status="SCHEDULED",estimated_cost=round(p.cost_per_hour*body.requirements.get("expected_runtime_hours",.05),4));p.status="BUSY";s.add(j)
+    estimated_tokens=estimate_tokens(body.requirements,p);wallet=wallet_for(s,u.id)
+    if wallet.token_balance<estimated_tokens: raise HTTPException(402,detail={"message":"Insufficient token balance","required":estimated_tokens,"available":wallet.token_balance})
+    j=Job(id=f"job_{secrets.token_hex(5)}",name=body.name,workload=body.workload,requirements=body.requirements,user_id=u.id,provider_id=p.id,status="SCHEDULED",estimated_cost=round(p.cost_per_hour*body.requirements.get("expected_runtime_hours",.05),4));p.status="BUSY";s.add(j);s.flush()
+    token_ledger(s,wallet,"JOB_RESERVATION",-estimated_tokens,"JOB",j.id,f"Reserved tokens for {j.name}",j.id);s.add(JobBilling(job_id=j.id,estimated_tokens=estimated_tokens,reserved_tokens=estimated_tokens))
     source=body.requirements.get("python_code","")
     if source.strip(): s.add(JobArtifact(id=f"art_{secrets.token_hex(8)}",job_id=j.id,user_id=u.id,filename=body.requirements.get("file_name",f"{j.name}.py"),content=source,size_bytes=len(source.encode("utf-8"))))
-    add_audit(s,"job.submitted",user_id=u.id,provider_id=p.id,job_id=j.id,details={"workload":body.workload});s.commit();return job_data(j)
+    add_audit(s,"job.submitted",user_id=u.id,provider_id=p.id,job_id=j.id,details={"workload":body.workload,"estimated_tokens":estimated_tokens});s.commit();return job_data(j,s)
 @app.get("/jobs/{job_id}")
 def get_job(job_id:str,u:User=Depends(current_user),s:Session=Depends(db)):
     j=s.get(Job,job_id)
     if not j or j.user_id!=u.id: raise HTTPException(404,"Job not found")
-    return job_data(j)
+    return job_data(j,s)
 @app.post("/jobs/{job_id}/cancel")
 def cancel(job_id:str,u:User=Depends(current_user),s:Session=Depends(db)):
     j=s.get(Job,job_id)
     if not j or j.user_id!=u.id: raise HTTPException(404,"Job not found")
-    j.status="CANCELLED";s.commit();return job_data(j)
+    refund_reservation(s,j,f"Refund for cancelled {j.name}")
+    j.status="CANCELLED";s.commit();return job_data(j,s)
 @app.post("/jobs/stop-all")
 def stop_all_jobs(u:User=Depends(current_user),s:Session=Depends(db)):
     jobs=s.query(Job).filter(Job.user_id==u.id,Job.status.in_(["QUEUED","SCHEDULED","RUNNING","RECOVERING"])).all()
@@ -199,7 +248,7 @@ def stop_all_jobs(u:User=Depends(current_user),s:Session=Depends(db)):
 def pending(provider_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
     queued=[]
     for job in s.query(Job).filter(Job.provider_id==provider_id,Job.status.in_(["SCHEDULED","RECOVERING"])).all():
-        payload=job_data(job)
+        payload=job_data(job,s)
         owner=s.get(User,job.user_id)
         payload["submitted_by"]=owner.email if owner else "unknown user"
         queued.append(payload)
@@ -215,7 +264,16 @@ def update_job(job_id:str,body:Update,_=Depends(provider_auth),s:Session=Depends
     if j.status=="RUNNING" and not j.started_at:j.started_at=datetime.now(timezone.utc)
     if j.status in ("COMPLETED","FAILED","CANCELLED"):
         j.completed_at=datetime.now(timezone.utc);p=s.get(Provider,j.provider_id);p.status="ONLINE"
-    s.commit();return job_data(j)
+        bill=s.get(JobBilling,j.id);wallet=wallet_for(s,j.user_id)
+        if bill and bill.reserved_tokens:
+            # Provider's reported duration becomes the deterministic actual token use.
+            elapsed=(body.result or {}).get("elapsed_seconds") if body.result else None
+            actual=min(bill.reserved_tokens,max(1,int(round(float(elapsed or 0)*2)))) if j.status=="COMPLETED" else 0
+            reserved=bill.reserved_tokens; bill.actual_tokens=actual; bill.reserved_tokens=0
+            # Close the reservation, then write the actual charge as its own ledger entry.
+            token_ledger(s,wallet,"JOB_REFUND",reserved,"JOB",j.id,f"Reservation settlement for {j.name}",j.id)
+            if actual: token_ledger(s,wallet,"JOB_USAGE",-actual,"JOB",j.id,f"Compute usage for {j.name}",j.id)
+    s.commit();return job_data(j,s)
 @app.post("/providers/jobs/{job_id}/checkpoint")
 def checkpoint(job_id:str,body:dict,_=Depends(provider_auth),s:Session=Depends(db)):
     j=s.get(Job,job_id)
@@ -228,18 +286,32 @@ def checkpoints(u:User=Depends(current_user),s:Session=Depends(db)):
 @app.get("/dashboard")
 def dashboard(u:User=Depends(current_user),s:Session=Depends(db)):
     js=s.query(Job).filter_by(user_id=u.id).all();ps=s.query(Provider).all();n=max(len(ps),1)
-    return {"active_jobs":sum(j.status in ("SCHEDULED","RUNNING","RECOVERING") for j in js),"available_nodes":sum(p.status in ("ONLINE","AVAILABLE") for p in ps),"monthly_spending":round(sum(j.actual_cost for j in js),4),"gpu_utilization":round(sum(p.utilization.get("gpu",0) for p in ps)/n,1),"cpu_utilization":round(sum(p.utilization.get("cpu",0) for p in ps)/n,1),"ram_utilization":round(sum(p.utilization.get("ram",0) for p in ps)/n,1),"recent_jobs":[job_data(j) for j in sorted(js,key=lambda x:x.created_at,reverse=True)[:5]]}
+    wallet=wallet_for(s,u.id);s.commit()
+    return {"active_jobs":sum(j.status in ("SCHEDULED","RUNNING","RECOVERING") for j in js),"available_nodes":sum(p.status in ("ONLINE","AVAILABLE") for p in ps),"token_balance":wallet.token_balance,"low_balance":wallet.token_balance<LOW_TOKEN_THRESHOLD,"gpu_utilization":round(sum(p.utilization.get("gpu",0) for p in ps)/n,1),"cpu_utilization":round(sum(p.utilization.get("cpu",0) for p in ps)/n,1),"ram_utilization":round(sum(p.utilization.get("ram",0) for p in ps)/n,1),"recent_jobs":[job_data(j,s) for j in sorted(js,key=lambda x:x.created_at,reverse=True)[:5]]}
 @app.get("/analytics")
 def analytics(u:User=Depends(current_user),s:Session=Depends(db)):
     js=s.query(Job).filter_by(user_id=u.id).all(); return {"job_success_rate":round(100*sum(j.status=="COMPLETED" for j in js)/max(sum(j.status in ("COMPLETED","FAILED") for j in js),1),1),"total_jobs":len(js),"recovery_count":sum(j.status=="RECOVERING" for j in js)}
 @app.get("/billing")
 def billing(u:User=Depends(current_user),s:Session=Depends(db)):
-    js=s.query(Job).filter_by(user_id=u.id).all()
-    return {"wallet_balance":u.wallet_balance,"total_spend":round(sum(j.actual_cost for j in js),4),"estimated_pending_cost":round(sum(j.estimated_cost for j in js if j.status in ("SCHEDULED","RUNNING","RECOVERING")),4),"jobs":[{"job_id":j.id,"name":j.name,"cost":j.actual_cost,"estimated_cost":j.estimated_cost,"status":j.status} for j in js]}
+    wallet=wallet_for(s,u.id);s.commit(); bills={x.job_id:x for x in s.query(JobBilling).join(Job).filter(Job.user_id==u.id).all()};js=s.query(Job).filter_by(user_id=u.id).all()
+    actual=sum((x.actual_tokens or 0) for x in bills.values());reserved=sum(x.reserved_tokens for x in bills.values())
+    return {"token_balance":wallet.token_balance,"wallet_balance":wallet.token_balance,"currency":"tokens","actual_usage":actual,"total_spend":actual,"reserved_tokens":reserved,"estimated_pending_cost":reserved,"packages":TOKEN_PACKAGES,"jobs":[{"job_id":j.id,"name":j.name,"actual_tokens":(bills.get(j.id).actual_tokens if bills.get(j.id) else None),"estimated_tokens":(bills.get(j.id).estimated_tokens if bills.get(j.id) else 0),"status":j.status} for j in js]}
+@app.get("/billing/transactions")
+def token_transactions(u:User=Depends(current_user),s:Session=Depends(db)):
+    return [{"id":x.id,"type":x.type,"amount":x.amount,"balance_before":x.balance_before,"balance_after":x.balance_after,"reference_id":x.reference_id,"description":x.description,"created_at":x.created_at} for x in s.query(TokenTransaction).filter_by(user_id=u.id).order_by(TokenTransaction.created_at.desc()).limit(50)]
+@app.post("/billing/purchase")
+def purchase_tokens(body:TokenPurchase,u:User=Depends(current_user),s:Session=Depends(db)):
+    package=next((x for x in TOKEN_PACKAGES if x["id"]==body.package_id),None)
+    if not package: raise HTTPException(422,"Unknown token package")
+    wallet=wallet_for(s,u.id);before=wallet.token_balance;after=token_ledger(s,wallet,"PURCHASE",package["tokens"],"PURCHASE",package["id"],f"Purchased {package['tokens']} tokens")
+    add_audit(s,"billing.token_purchase",user_id=u.id,details={"package":package["id"],"tokens":package["tokens"]});s.commit();return {"success":True,"tokens_added":package["tokens"],"previous_balance":before,"new_balance":after}
 @app.post("/billing/demo-topup")
 def demo_topup(body:DemoTopUp,u:User=Depends(current_user),s:Session=Depends(db)):
     # College-project demo only: card data is validated for form completeness and never stored or transmitted.
     digits="".join(ch for ch in body.card_number if ch.isdigit())
     if len(digits) < 12: raise HTTPException(422,"Enter a valid test card number")
-    u.wallet_balance=round(u.wallet_balance+body.amount,2);s.add(BillingTransaction(id=f"txn_{secrets.token_hex(8)}",user_id=u.id,kind="demo_topup",amount=body.amount,reference=f"demo-card-{digits[-4:]}"));add_audit(s,"billing.demo_topup",user_id=u.id,details={"amount":body.amount});s.commit()
-    return {"wallet_balance":u.wallet_balance,"credited":body.amount,"card_last4":digits[-4:],"mode":"demo"}
+    package=next((x for x in TOKEN_PACKAGES if x["price"]==int(body.amount)),None)
+    if not package: raise HTTPException(422,"Choose one of the configured demo packages: $10, $25, or $50")
+    wallet=wallet_for(s,u.id);before=wallet.token_balance;after=token_ledger(s,wallet,"PURCHASE",package["tokens"],"PURCHASE",package["id"],f"Purchased {package['tokens']} tokens")
+    add_audit(s,"billing.token_purchase",user_id=u.id,details={"package":package["id"],"tokens":package["tokens"]});s.commit()
+    return {"wallet_balance":after,"credited":package["tokens"],"tokens_added":package["tokens"],"previous_balance":before,"card_last4":digits[-4:],"mode":"demo"}

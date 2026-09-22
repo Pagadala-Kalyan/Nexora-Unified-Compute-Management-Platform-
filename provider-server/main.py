@@ -1,5 +1,5 @@
 """Nexora provider agent: runs team-submitted Python workloads on this device."""
-import os, platform, time, threading, subprocess, sys, tempfile
+import os, platform, time, threading, subprocess, sys, tempfile, importlib.util
 import psutil, requests
 
 BASE=os.getenv("UCMP_BACKEND_URL","http://127.0.0.1:8000").rstrip("/")
@@ -67,4 +67,9 @@ def listener():
         time.sleep(2)
 if __name__=="__main__":
     print("Nexora Provider Server — executing workloads on this provider device")
+    print(f"Provider Python: {sys.executable}")
+    if importlib.util.find_spec("torch"):
+        import torch
+        print(f"PyTorch: {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
+    else: print("PyTorch: not installed for this provider interpreter")
     register(); threading.Thread(target=heartbeat,daemon=True).start(); listener()
