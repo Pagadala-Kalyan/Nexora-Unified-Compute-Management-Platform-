@@ -1,5 +1,6 @@
 """Nexora provider agent: runs team-submitted Python workloads on this device."""
 import os, platform, time, threading, subprocess, sys, tempfile, importlib.util
+from datetime import datetime
 import psutil, requests
 
 BASE=os.getenv("UCMP_BACKEND_URL","http://127.0.0.1:8000").rstrip("/")
@@ -23,7 +24,8 @@ def checkpoint(job_id, progress, started_at, workload):
     request("POST",f"/providers/jobs/{job_id}/update",json={"progress":progress})
     request("POST",f"/providers/jobs/{job_id}/checkpoint",json={"progress":progress,"state":{
         "iteration":progress,"workload":workload,"provider":PID,
-        "elapsed_seconds":round(time.perf_counter()-started_at,4)
+        "elapsed_seconds":round(time.perf_counter()-started_at,4),
+        "recorded_at":datetime.now().astimezone().isoformat()
     }})
 
 def run_matrix_multiply(size, report):

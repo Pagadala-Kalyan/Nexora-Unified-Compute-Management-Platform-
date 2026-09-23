@@ -282,7 +282,9 @@ def checkpoint(job_id:str,body:dict,_=Depends(provider_auth),s:Session=Depends(d
 @app.get("/checkpoints")
 def checkpoints(u:User=Depends(current_user),s:Session=Depends(db)):
     rows=s.query(Checkpoint,Job).join(Job, Checkpoint.job_id==Job.id).filter(Job.user_id==u.id).order_by(Checkpoint.created_at.desc()).all()
-    return [{"id":c.id,"job_id":j.id,"job_name":j.name,"provider_id":c.provider_id,"progress":c.progress,"payload":c.payload,"created_at":c.created_at} for c,j in rows]
+    # Prefer the provider's system-clock timestamp. The database timestamp remains
+    # available in payload for legacy checkpoints that do not include recorded_at.
+    return [{"id":c.id,"job_id":j.id,"job_name":j.name,"provider_id":c.provider_id,"progress":c.progress,"payload":c.payload,"created_at":c.payload.get("state",{}).get("recorded_at",c.created_at) if isinstance(c.payload,dict) else c.created_at} for c,j in rows]
 @app.get("/dashboard")
 def dashboard(u:User=Depends(current_user),s:Session=Depends(db)):
     js=s.query(Job).filter_by(user_id=u.id).all();ps=s.query(Provider).all();n=max(len(ps),1)
