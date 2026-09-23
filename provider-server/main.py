@@ -17,6 +17,64 @@ def heartbeat():
         try: request("POST",f"/providers/{PID}/heartbeat",json={"status":"BUSY" if active_jobs else "ONLINE","utilization":utilization()}).raise_for_status()
         except requests.RequestException as e: print(f"heartbeat failed: {e}")
         time.sleep(INTERVAL)
+
+def checkpoint(job_id, progress, started_at, workload):
+    """Persist a checkpoint only after the corresponding computation finished."""
+    request("POST",f"/providers/jobs/{job_id}/update",json={"progress":progress})
+    request("POST",f"/providers/jobs/{job_id}/checkpoint",json={"progress":progress,"state":{
+        "iteration":progress,"workload":workload,"provider":PID,
+        "elapsed_seconds":round(time.perf_counter()-started_at,4)
+    }})
+
+def run_matrix_multiply(size, report):
+    """Multiply two real size × size matrices, one quarter of the rows at a time."""
+    if not importlib.util.find_spec("torch"):
+        raise RuntimeError("Matrix computation requires PyTorch on this provider. Run the provider with its PyTorch virtual environment.")
+    import torch
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Deterministic values make the reported checksum reproducible for a given size.
+    left=torch.arange(size*size,dtype=torch.float32,device=device).reshape(size,size).remainder(101)
+    right=torch.arange(size*size,dtype=torch.float32,device=device).reshape(size,size).remainder(89)
+    checksum=0.0
+    for part in range(4):
+        row_start=(part*size)//4; row_end=((part+1)*size)//4
+        product=torch.matmul(left[row_start:row_end],right)
+        if device.type=="cuda": torch.cuda.synchronize()
+        checksum+=float(product.sum().item())
+        report((part+1)*25)
+    return {"operation":"matrix multiplication","matrix_shape":[size,size],"device":str(device),"checksum":round(checksum,3)}
+
+def is_prime(number):
+    if number<2: return False
+    if number==2: return True
+    if number%2==0: return False
+    divisor=3
+    while divisor*divisor<=number:
+        if number%divisor==0: return False
+        divisor+=2
+    return True
+
+def run_prime_search(limit, report):
+    """Find every actual prime from 2 through the requested upper limit."""
+    primes=[]
+    for part in range(4):
+        start=max(2,(part*limit)//4+1); end=((part+1)*limit)//4
+        primes.extend(number for number in range(start,end+1) if is_prime(number))
+        report((part+1)*25)
+    return {"operation":"prime number search","upper_limit":limit,"prime_count":len(primes),"last_prime":primes[-1] if primes else None,"primes":primes}
+
+def run_fibonacci(index, report):
+    """Calculate the genuine Fibonacci number at the requested zero-based index."""
+    previous,current=0,1
+    completed=0
+    for part in range(4):
+        target=((part+1)*index)//4
+        while completed<target:
+            previous,current=current,previous+current
+            completed+=1
+        report((part+1)*25)
+    return {"operation":"fibonacci calculation","index":index,"value":previous,"digits":len(str(previous))}
+
 def execute(job):
     global active_jobs
     jid=job["id"]; active_jobs+=1
@@ -25,31 +83,22 @@ def execute(job):
     try:
         workload=job["workload"]
         size=min(max(int(job["requirements"].get("matrix_size",300)),10),1200)
-        total=0; a,b=0,1
-        resume_at=int(job["requirements"].get("resume_from_progress",0))
-        checkpoint_start=((resume_at // 25) + 1) * 25
-        steps=range(checkpoint_start,101,25) if workload != "custom_python" else (100,)
-        for progress in steps:
-            # Each checkpoint follows work actually completed on this device.
-            start=max(0,((progress-25)*size*20)//100); end=(progress*size*20)//100
-            if workload == "matrix_multiply": total+=sum((i*i)%97 for i in range(start,end))
-            elif workload == "prime_search": total+=sum(1 for n in range(max(2,start),max(2,end)) if all(n%d for d in range(2,int(n**.5)+1)))
-            elif workload == "fibonacci":
-                start=max(0,((progress-25)*size*100)//100); end=(progress*size*100)//100
-                for _ in range(start,end): a,b=b,a+b
-                total=len(str(a))
-            elif workload == "custom_python":
-                code=job["requirements"].get("python_code","")
-                if not code.strip(): raise ValueError("No Python code was supplied")
-                filename=job["requirements"].get("file_name","nexora_workload.py")
-                with tempfile.TemporaryDirectory(prefix="nexora-job-") as workdir:
-                    source=os.path.join(workdir, os.path.basename(filename))
-                    with open(source,"w",encoding="utf-8") as submitted: submitted.write(code)
-                    process=subprocess.run([sys.executable,"-I",source],capture_output=True,text=True,timeout=int(job["requirements"].get("timeout_seconds",20)),cwd=workdir)
-                if process.returncode: raise RuntimeError(process.stderr[-1500:] or "Python workload failed")
-                total=process.stdout[-4000:]
-            request("POST",f"/providers/jobs/{jid}/update",json={"progress":progress})
-            if progress in (25,50,75,100): request("POST",f"/providers/jobs/{jid}/checkpoint",json={"progress":progress,"state":{"iteration":progress,"workload":job["workload"],"provider":PID,"elapsed_seconds":round(time.perf_counter()-started_at,4)}})
+        report=lambda progress: checkpoint(jid,progress,started_at,workload)
+        if workload == "matrix_multiply": total=run_matrix_multiply(size,report)
+        elif workload == "prime_search": total=run_prime_search(size,report)
+        elif workload == "fibonacci": total=run_fibonacci(size,report)
+        elif workload == "custom_python":
+            code=job["requirements"].get("python_code","")
+            if not code.strip(): raise ValueError("No Python code was supplied")
+            filename=job["requirements"].get("file_name","nexora_workload.py")
+            with tempfile.TemporaryDirectory(prefix="nexora-job-") as workdir:
+                source=os.path.join(workdir, os.path.basename(filename))
+                with open(source,"w",encoding="utf-8") as submitted: submitted.write(code)
+                process=subprocess.run([sys.executable,"-I",source],capture_output=True,text=True,timeout=int(job["requirements"].get("timeout_seconds",20)),cwd=workdir)
+            if process.returncode: raise RuntimeError(process.stderr[-1500:] or "Python workload failed")
+            total=process.stdout[-4000:]
+            report(100)
+        else: raise ValueError(f"Unsupported workload type: {workload}")
         message={"matrix_multiply":"Matrix computation completed","prime_search":"Prime search completed","fibonacci":"Fibonacci computation completed","custom_python":"Uploaded Python code completed"}.get(workload,"Workload completed")
         elapsed=round(time.perf_counter()-started_at,4)
         request("POST",f"/providers/jobs/{jid}/update",json={"status":"COMPLETED","progress":100,"actual_cost":round(.15/3600*elapsed,5),"result":{"message":message,"workload":workload,"input_size":size,"output":total,"provider":PID,"elapsed_seconds":elapsed}})
