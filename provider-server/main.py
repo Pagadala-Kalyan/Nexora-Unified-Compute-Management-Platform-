@@ -17,6 +17,7 @@ from datetime import datetime
 import psutil
 import requests
 import shutil
+import argparse
 from pathlib import Path
 
 
@@ -50,13 +51,62 @@ def get_ffmpeg_version():
 
 
 # ============================================================
-# BACKEND CONFIGURATION
+# BACKEND CONFIGURATION & CONNECTIVITY DISCOVERY
 # ============================================================
+
+DEFAULT_LOCAL_URL = "http://127.0.0.1:8000"
+DEFAULT_ONLINE_URL = "https://nexora-unified-compute-management.onrender.com"
+
+def check_backend_health(url: str, timeout: float = 3.0) -> bool:
+    """Probes /health endpoint to check if control plane is responding."""
+    try:
+        clean = url.rstrip("/")
+        resp = requests.get(f"{clean}/health", timeout=timeout)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+def discover_backend_url(preferred_mode: str = "auto", custom_url: str = None) -> str:
+    """
+    Discovers the active Nexora control plane URL:
+    - If custom_url or UCMP_BACKEND_URL is set, prioritizes it.
+    - If preferred_mode is 'online', targets DEFAULT_ONLINE_URL.
+    - If preferred_mode is 'local', targets DEFAULT_LOCAL_URL.
+    - If preferred_mode is 'auto', probes LOCAL first, then ONLINE cloud backend.
+    """
+    if custom_url:
+        return custom_url.rstrip("/")
+
+    env_url = os.getenv("UCMP_BACKEND_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    if preferred_mode == "online":
+        return DEFAULT_ONLINE_URL
+    elif preferred_mode == "local":
+        return DEFAULT_LOCAL_URL
+
+    # Auto discovery: check if local dev server is active first
+    print("[CONNECTIVITY] Probing local control plane (127.0.0.1:8000)...")
+    if check_backend_health(DEFAULT_LOCAL_URL, timeout=1.5):
+        print(f"[CONNECTIVITY] Found active local control plane at {DEFAULT_LOCAL_URL}")
+        return DEFAULT_LOCAL_URL
+
+    print("[CONNECTIVITY] Probing cloud control plane (onrender.com)...")
+    if check_backend_health(DEFAULT_ONLINE_URL, timeout=3.5):
+        print(f"[CONNECTIVITY] Found active cloud control plane at {DEFAULT_ONLINE_URL}")
+        return DEFAULT_ONLINE_URL
+
+    # If neither responded immediately (e.g. Render waking up), default to online cloud
+    print(f"[CONNECTIVITY] Localhost offline. Targeting cloud control plane at {DEFAULT_ONLINE_URL}")
+    return DEFAULT_ONLINE_URL
 
 BASE = os.getenv(
     "UCMP_BACKEND_URL",
-    "http://127.0.0.1:8000"
+    DEFAULT_ONLINE_URL
 ).rstrip("/")
+
+is_connected = False
 
 TOKEN = os.getenv(
     "PROVIDER_SHARED_TOKEN",
@@ -328,12 +378,12 @@ SYSTEM_INFO = get_system_info()
 # ============================================================
 
 def request(method, path, **kwargs):
-
+    timeout = kwargs.pop("timeout", 15)
     return requests.request(
         method,
         BASE + path,
         headers=HEAD,
-        timeout=10,
+        timeout=timeout,
         **kwargs
     )
 
@@ -507,17 +557,36 @@ def register():
     print("--------------------------------")
     print()
 
-    response = request(
-        "POST",
-        "/providers/register",
-        json=data
-    )
+    attempt = 1
+    backoff = 3
+    while True:
+        try:
+            print(f"[CONNECTING] Registering with control plane at {BASE}...")
+            response = request(
+                "POST",
+                "/providers/register",
+                json=data,
+                timeout=15
+            )
+            response.raise_for_status()
+            is_connected = True
+            print(f"[ONLINE] Successfully connected and registered as {NAME} ({PID})")
+            return response
+        except Exception as e:
+            is_connected = False
+            if not retry_indefinitely:
+                raise
 
-    response.raise_for_status()
+            # If local host was targeted and unreachable, switch to online cloud backend
+            if BASE == DEFAULT_LOCAL_URL and attempt >= 2:
+                print(f"[AUTO-FAILOVER] Localhost unreachable. Switching to cloud control plane ({DEFAULT_ONLINE_URL})...")
+                BASE = DEFAULT_ONLINE_URL
 
-    print(
-        f"Connected as {NAME} ({PID})"
-    )
+            print(f"[OFFLINE] Cannot reach control plane at {BASE} ({e})")
+            print(f"          Retrying in {backoff}s... (Render free instances take ~50s to wake from sleep)")
+            time.sleep(backoff)
+            backoff = min(15, backoff + 2)
+            attempt += 1
 
 
 # ============================================================
@@ -525,31 +594,31 @@ def register():
 # ============================================================
 
 def heartbeat():
-
+    global is_connected
     while True:
-
-        try:
-
-            request(
-                "POST",
-                f"/providers/{PID}/heartbeat",
-                json={
-                    "status":
-                        "BUSY"
-                        if active_jobs
-                        else "ONLINE",
-
-                    "utilization":
-                        utilization()
-                }
-            ).raise_for_status()
-
-        except requests.RequestException as e:
-
-            print(
-                f"heartbeat failed: {e}"
-            )
-
+        if is_connected:
+            try:
+                res = request(
+                    "POST",
+                    f"/providers/{PID}/heartbeat",
+                    json={
+                        "status": "BUSY" if active_jobs else "ONLINE",
+                        "utilization": utilization()
+                    },
+                    timeout=8
+                )
+                if res.status_code == 404:
+                    print("[NOTICE] Registration expired or control plane rebooted. Re-registering...")
+                    try:
+                        register(retry_indefinitely=False)
+                    except Exception:
+                        pass
+                else:
+                    res.raise_for_status()
+            except requests.RequestException:
+                if is_connected:
+                    print(f"[HEARTBEAT] Connection to {BASE} interrupted. Entering standby.")
+                    is_connected = False
         time.sleep(INTERVAL)
 
 
@@ -1419,22 +1488,31 @@ def execute(job):
 # ============================================================
 
 def listener():
-
+    global is_connected
     while True:
-
         try:
+            if not is_connected:
+                # In offline standby: probe health before polling
+                if check_backend_health(BASE, timeout=3.5):
+                    print(f"[RECONNECTED] Control plane at {BASE} is reachable! Re-registering...")
+                    try:
+                        register(retry_indefinitely=False)
+                    except Exception:
+                        time.sleep(3)
+                        continue
+                else:
+                    time.sleep(5)
+                    continue
 
             response = request(
                 "GET",
-                f"/providers/{PID}/jobs/pending"
+                f"/providers/{PID}/jobs/pending",
+                timeout=10
             )
-
             response.raise_for_status()
 
             jobs = response.json()
-
             for job in jobs:
-
                 threading.Thread(
                     target=execute,
                     args=(job,),
@@ -1442,12 +1520,12 @@ def listener():
                 ).start()
 
         except requests.RequestException as e:
-
-            print(
-                f"poll failed: {e}"
-            )
-
-        time.sleep(2)
+            if is_connected:
+                print(f"[OFFLINE] Connection dropped ({e}). Polling paused until control plane reconnects.")
+                is_connected = False
+            time.sleep(5)
+        else:
+            time.sleep(2)
 
 
 # ============================================================
@@ -1455,6 +1533,14 @@ def listener():
 # ============================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Nexora Compute Provider Node")
+    parser.add_argument("--online", action="store_true", help="Connect to cloud control plane (Render)")
+    parser.add_argument("--local", action="store_true", help="Connect to localhost control plane (127.0.0.1:8000)")
+    parser.add_argument("--url", type=str, default=None, help="Custom control plane URL")
+    args, _ = parser.parse_known_args()
+
+    mode = "online" if args.online else ("local" if args.local else "auto")
+    BASE = discover_backend_url(preferred_mode=mode, custom_url=args.url)
 
     print()
     print(
