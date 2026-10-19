@@ -476,7 +476,8 @@ def utilization():
 # PROVIDER REGISTRATION
 # ============================================================
 
-def register():
+def register(retry_indefinitely=True):
+    global BASE, is_connected
 
     # Backend currently requires these fields.
     # Additional hardware information is included
@@ -1537,7 +1538,12 @@ if __name__ == "__main__":
     parser.add_argument("--online", action="store_true", help="Connect to cloud control plane (Render)")
     parser.add_argument("--local", action="store_true", help="Connect to localhost control plane (127.0.0.1:8000)")
     parser.add_argument("--url", type=str, default=None, help="Custom control plane URL")
+    parser.add_argument("--token", type=str, default=None, help="Provider shared secret token")
     args, _ = parser.parse_known_args()
+
+    if args.token:
+        TOKEN = args.token
+        HEAD["X-Provider-Token"] = TOKEN
 
     mode = "online" if args.online else ("local" if args.local else "auto")
     BASE = discover_backend_url(preferred_mode=mode, custom_url=args.url)

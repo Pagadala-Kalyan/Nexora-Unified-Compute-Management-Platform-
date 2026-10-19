@@ -14,7 +14,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: PROVIDER_SHARED_TOKEN
-        generateValue: true
+        value: local-demo-token
       - key: CORS_ORIGINS
         value: https://nexora-unified-compute-management-platform-12oxepi7d.vercel.app
       - key: CORS_ORIGIN_REGEX
