@@ -53,20 +53,18 @@ if not defined PYTHON (
     exit /b 1
 )
 
-REM ─── Auto-install requirements if using venv ─────────────────────────────────
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -c "import fastapi, uvicorn" >nul 2>&1
+REM ─── Auto-install requirements if any are missing ─────────────────────────
+"%PYTHON%" -c "import fastapi, uvicorn, multipart, imageio_ffmpeg" >nul 2>&1
+if not !errorlevel!==0 (
+    echo [SETUP] Missing dependencies detected. Installing requirements...
+    "%PYTHON%" -m pip install -r requirements.txt
     if not !errorlevel!==0 (
-        echo [SETUP] Installing requirements...
-        ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-        if not !errorlevel!==0 (
-            echo [ERROR] pip install failed. Check your internet connection.
-            pause
-            exit /b 1
-        )
-        echo [SETUP] Requirements installed.
-        echo.
+        echo [ERROR] pip install failed. Check your internet connection.
+        pause
+        exit /b 1
     )
+    echo [SETUP] Requirements installed successfully.
+    echo.
 )
 
 REM ─── Environment ─────────────────────────────────────────────────────────────
