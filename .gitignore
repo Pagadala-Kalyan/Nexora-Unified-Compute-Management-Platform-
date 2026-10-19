@@ -7,3 +7,4 @@ nexora.db
 *.bak
 node_modules/
 dist/
+user-website/backend/data/

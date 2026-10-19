@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import re
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -10,7 +13,7 @@ from enum import Enum
 from typing import Optional
 
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +31,67 @@ TOKEN_PACKAGES=[{"id":"starter","price":10,"tokens":100},{"id":"standard","price
 LOW_TOKEN_THRESHOLD=int(os.getenv("LOW_TOKEN_THRESHOLD","100"))
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, autoflush=False)
+
+# Durable Artifact Storage Configuration
+ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+MAX_VIDEO_UPLOAD_BYTES = int(os.getenv("MAX_VIDEO_UPLOAD_BYTES", 50 * 1024 * 1024)) # 50 MB
+MAX_VIDEO_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_DURATION_SECONDS", 300)) # 5 minutes
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+ALLOWED_VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "application/octet-stream"}
+
+def get_ffmpeg_binary():
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+def probe_video_file(file_path: Path) -> dict:
+    ffmpeg_bin = get_ffmpeg_binary()
+    if not ffmpeg_bin:
+        return {"valid": False, "error": "FFmpeg not available on control plane to probe media"}
+    try:
+        proc = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-i", str(file_path)],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        out = proc.stderr
+        dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
+        duration = None
+        if dur_match:
+            h, m, s = float(dur_match.group(1)), float(dur_match.group(2)), float(dur_match.group(3))
+            duration = round(h * 3600 + m * 60 + s, 2)
+        video_match = re.search(r"Stream.*Video:\s*([a-zA-Z0-9_\-]+).*?(\d{2,5})x(\d{2,5})", out)
+        codec = video_match.group(1).lower() if video_match else None
+        width = int(video_match.group(2)) if video_match else None
+        height = int(video_match.group(3)) if video_match else None
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", out)
+        fps = float(fps_match.group(1)) if fps_match else None
+        has_audio = "Audio:" in out
+        valid = bool(video_match and duration and duration > 0)
+        return {
+            "valid": valid,
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "codec": codec,
+            "fps": fps,
+            "has_audio": has_audio,
+            "error": None if valid else "No valid video stream identified in file"
+        }
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+def sanitize_filename(name: str) -> str:
+    clean = re.sub(r'[^a-zA-Z0-9_.-]', '_', os.path.basename(name))
+    return clean or "video.mp4"
+
 def hash_password(password: str) -> str:
     """PBKDF2 is dependency-free and stable across provider/control-plane hosts."""
     salt = secrets.token_bytes(16)
@@ -52,7 +116,8 @@ class Provider(Base):
     cpu_cores: Mapped[int]=mapped_column(Integer); ram_gb: Mapped[float]=mapped_column(Float); gpu_name: Mapped[Optional[str]]=mapped_column(String, nullable=True)
     gpu_memory_gb: Mapped[float]=mapped_column(Float, default=0); cost_per_hour: Mapped[float]=mapped_column(Float, default=.25)
     status: Mapped[str]=mapped_column(String, default="ONLINE"); reliability: Mapped[float]=mapped_column(Float, default=100)
-    utilization: Mapped[dict]=mapped_column(JSON, default=dict); last_heartbeat: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    utilization: Mapped[dict]=mapped_column(JSON, default=dict); system_info: Mapped[dict]=mapped_column(JSON, default=dict)
+    last_heartbeat: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class User(Base):
     __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); email: Mapped[str]=mapped_column(String, unique=True); password_hash: Mapped[str]=mapped_column(String); wallet_balance: Mapped[float]=mapped_column(Float, default=100)
 class Job(Base):
@@ -72,8 +137,18 @@ class AuthSession(Base):
     issued_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)); expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True)); revoked: Mapped[bool]=mapped_column(Boolean, default=False)
 class JobArtifact(Base):
     __tablename__="job_artifacts"
-    id: Mapped[str]=mapped_column(String, primary_key=True); job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id"), index=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True)
-    filename: Mapped[str]=mapped_column(String); media_type: Mapped[str]=mapped_column(String, default="text/x-python"); content: Mapped[Text]=mapped_column(Text); size_bytes: Mapped[int]=mapped_column(Integer); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    id: Mapped[str]=mapped_column(String, primary_key=True)
+    job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True)
+    artifact_type: Mapped[str]=mapped_column(String, default="input")
+    filename: Mapped[str]=mapped_column(String)
+    media_type: Mapped[str]=mapped_column(String, default="video/mp4")
+    file_path: Mapped[Optional[str]]=mapped_column(String, nullable=True)
+    size_bytes: Mapped[int]=mapped_column(Integer, default=0)
+    checksum_sha256: Mapped[Optional[str]]=mapped_column(String, nullable=True)
+    meta_data: Mapped[dict]=mapped_column(JSON, default=dict)
+    content: Mapped[Optional[Text]]=mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class BillingTransaction(Base):
     __tablename__="billing_transactions"
     id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True)
@@ -97,7 +172,7 @@ class AuditEvent(Base):
 class Register(BaseModel): email: str; password: str = Field(min_length=8)
 class Login(Register): pass
 class JobCreate(BaseModel): name: str = Field(min_length=2, max_length=100); workload: str = "matrix_multiply"; requirements: dict = Field(default_factory=dict)
-class ProviderRegister(BaseModel): id: str; name: str; cpu_cores: int = Field(ge=1); ram_gb: float = Field(gt=0); gpu_name: Optional[str]=None; gpu_memory_gb: float=0; cost_per_hour: float=.25
+class ProviderRegister(BaseModel): id: str; name: str; cpu_cores: int = Field(ge=1); ram_gb: float = Field(gt=0); gpu_name: Optional[str]=None; gpu_memory_gb: float=0; cost_per_hour: float=.25; system_info: Optional[dict]=None
 class Heartbeat(BaseModel): status: str="ONLINE"; utilization: dict=Field(default_factory=dict)
 class Update(BaseModel): status: Optional[JobStatus]=None; progress: Optional[int]=Field(None, ge=0, le=100); result: Optional[dict]=None; actual_cost: Optional[float]=None; attempt: Optional[int]=None
 class DemoTopUp(BaseModel): amount: float = Field(gt=0, le=10000); card_number: str = Field(min_length=12, max_length=23); cardholder: str = Field(min_length=2, max_length=80); expiry: str = Field(min_length=4, max_length=7); cvc: str = Field(min_length=3, max_length=4)
@@ -131,6 +206,12 @@ def token_ledger(s,wallet,kind,amount,reference_type,reference_id,description,jo
     s.add(TokenTransaction(id=f"tok_{secrets.token_hex(8)}",user_id=wallet.user_id,wallet_id=wallet.id,job_id=job_id,type=kind,amount=amount,balance_before=before,balance_after=after,reference_type=reference_type,reference_id=reference_id,description=description))
     return after
 def estimate_tokens(requirements, provider):
+    workload = requirements.get("workload")
+    if workload == "video_compress":
+        duration = float(requirements.get("input_duration_seconds", 60))
+        resolution = requirements.get("target_resolution", "720p")
+        res_mult = {"1080p": 3, "720p": 2, "480p": 1, "original": 2}.get(resolution, 2)
+        return max(5, int(round(duration * res_mult * 0.5 + 10)))
     hours=max(float(requirements.get("expected_runtime_hours",.05)),.01)
     multiplier=8 if requirements.get("gpu_required") or requirements.get("workload_type")=="gpu" else 2
     if requirements.get("python_code") and "torch" in requirements["python_code"]: multiplier=10
@@ -167,9 +248,10 @@ def job_data(j, s=None):
         "estimated_tokens":bill.estimated_tokens if bill else 0,"reserved_tokens":bill.reserved_tokens if bill else 0,
         "actual_tokens":bill.actual_tokens if bill else None,"created_at":j.created_at
     }
-def provider_data(p): return {"id":p.id,"name":p.name,"cpu_cores":p.cpu_cores,"ram_gb":p.ram_gb,"gpu_name":p.gpu_name,"gpu_memory_gb":p.gpu_memory_gb,"cost_per_hour":p.cost_per_hour,"status":p.status,"reliability":p.reliability,"utilization":p.utilization,"last_heartbeat":p.last_heartbeat}
+def provider_data(p): return {"id":p.id,"name":p.name,"cpu_cores":p.cpu_cores,"ram_gb":p.ram_gb,"gpu_name":p.gpu_name,"gpu_memory_gb":p.gpu_memory_gb,"cost_per_hour":p.cost_per_hour,"status":p.status,"reliability":p.reliability,"utilization":p.utilization,"system_info":p.system_info or {},"last_heartbeat":p.last_heartbeat}
 def compatible_provider(s, requirements, exclude_id=None):
-    candidates=[p for p in s.query(Provider).all() if p.id!=exclude_id and p.status in ("ONLINE","AVAILABLE") and p.cpu_cores>=requirements.get("cpu_cores",1) and p.ram_gb>=requirements.get("ram_gb",1) and (not requirements.get("gpu_required") or p.gpu_name)]
+    workload = requirements.get("workload")
+    candidates=[p for p in s.query(Provider).all() if p.id!=exclude_id and p.status in ("ONLINE","AVAILABLE") and p.cpu_cores>=requirements.get("cpu_cores",1) and p.ram_gb>=requirements.get("ram_gb",1) and (not requirements.get("gpu_required") or p.gpu_name) and (workload != "video_compress" or (p.system_info or {}).get("ffmpeg_available"))]
     return min(candidates,key=lambda x:x.cost_per_hour/(max(x.reliability,1)/100)) if candidates else None
 def recover_lost_providers():
     """Detect provider loss and re-dispatch checkpointed controlled workloads with generation fencing."""
@@ -219,7 +301,9 @@ def ensure_schema_columns(s):
         if bind.dialect.name == "sqlite":
             for table, cols in [
                 ("jobs", [("attempt", "INTEGER DEFAULT 1"), ("recovery_count", "INTEGER DEFAULT 0")]),
-                ("checkpoints", [("seq", "INTEGER DEFAULT 1"), ("attempt", "INTEGER DEFAULT 1"), ("state_version", "INTEGER DEFAULT 1"), ("state_hash", "TEXT DEFAULT ''")])
+                ("checkpoints", [("seq", "INTEGER DEFAULT 1"), ("attempt", "INTEGER DEFAULT 1"), ("state_version", "INTEGER DEFAULT 1"), ("state_hash", "TEXT DEFAULT ''")]),
+                ("job_artifacts", [("artifact_type", "TEXT DEFAULT 'input'"), ("file_path", "TEXT"), ("checksum_sha256", "TEXT"), ("meta_data", "TEXT DEFAULT '{}'")]),
+                ("providers", [("system_info", "TEXT DEFAULT '{}'")])
             ]:
                 existing = [r[1] for r in s.execute(text(f"PRAGMA table_info({table})")).fetchall()]
                 for col_name, col_def in cols:
@@ -259,9 +343,10 @@ def providers(_:User=Depends(current_user),s:Session=Depends(db)): return [provi
 @app.post("/providers/register")
 def provider_register(body:ProviderRegister,_=Depends(provider_auth),s:Session=Depends(db)):
     p=s.get(Provider,body.id)
-    if not p: p=Provider(**body.model_dump());s.add(p)
+    data=body.model_dump()
+    if not p: p=Provider(**data);s.add(p)
     else:
-        for k,v in body.model_dump().items(): setattr(p,k,v)
+        for k,v in data.items(): setattr(p,k,v)
         p.status="ONLINE"
     s.commit();return provider_data(p)
 @app.post("/providers/{provider_id}/heartbeat")
@@ -273,12 +358,27 @@ def heartbeat(provider_id:str,body:Heartbeat,_=Depends(provider_auth),s:Session=
 def jobs(u:User=Depends(current_user),s:Session=Depends(db)): return [job_data(j,s) for j in s.query(Job).filter_by(user_id=u.id).order_by(Job.created_at.desc()).all()]
 @app.post("/jobs")
 def create_job(body:JobCreate,u:User=Depends(current_user),s:Session=Depends(db)):
-    p=compatible_provider(s,body.requirements)
+    reqs = {**body.requirements, "workload": body.workload}
+    art_id = None
+    if body.workload == "video_compress":
+        art_id = body.requirements.get("input_artifact_id")
+        if not art_id:
+            raise HTTPException(422, "video_compress requires input_artifact_id in requirements")
+        art = s.get(JobArtifact, art_id)
+        if not art or art.user_id != u.id:
+            raise HTTPException(404, "Input artifact not found")
+        meta = art.meta_data or {}
+        if meta.get("duration") and "input_duration_seconds" not in reqs:
+            reqs["input_duration_seconds"] = meta["duration"]
+    p=compatible_provider(s,reqs)
     if not p: raise HTTPException(409,"No compatible online provider is available")
-    estimated_tokens=estimate_tokens(body.requirements,p);wallet=wallet_for(s,u.id)
+    estimated_tokens=estimate_tokens(reqs,p);wallet=wallet_for(s,u.id)
     if wallet.token_balance<estimated_tokens: raise HTTPException(402,detail={"message":"Insufficient token balance","required":estimated_tokens,"available":wallet.token_balance})
-    j=Job(id=f"job_{secrets.token_hex(5)}",name=body.name,workload=body.workload,requirements=body.requirements,user_id=u.id,provider_id=p.id,status="SCHEDULED",estimated_cost=round(p.cost_per_hour*body.requirements.get("expected_runtime_hours",.05),4));p.status="BUSY";s.add(j);s.flush()
+    j=Job(id=f"job_{secrets.token_hex(5)}",name=body.name,workload=body.workload,requirements=reqs,user_id=u.id,provider_id=p.id,status="SCHEDULED",estimated_cost=round(p.cost_per_hour*reqs.get("expected_runtime_hours",.05),4));p.status="BUSY";s.add(j);s.flush()
     token_ledger(s,wallet,"JOB_RESERVATION",-estimated_tokens,"JOB",j.id,f"Reserved tokens for {j.name}",j.id);s.add(JobBilling(job_id=j.id,estimated_tokens=estimated_tokens,reserved_tokens=estimated_tokens))
+    if body.workload == "video_compress" and art_id:
+        art = s.get(JobArtifact, art_id)
+        if art: art.job_id = j.id
     source=body.requirements.get("python_code","")
     if source.strip(): s.add(JobArtifact(id=f"art_{secrets.token_hex(8)}",job_id=j.id,user_id=u.id,filename=body.requirements.get("file_name",f"{j.name}.py"),content=source,size_bytes=len(source.encode("utf-8"))))
     add_audit(s,"job.submitted",user_id=u.id,provider_id=p.id,job_id=j.id,details={"workload":body.workload,"estimated_tokens":estimated_tokens});s.commit();return job_data(j,s)
@@ -479,3 +579,211 @@ def demo_topup(body:DemoTopUp,u:User=Depends(current_user),s:Session=Depends(db)
     wallet=wallet_for(s,u.id);before=wallet.token_balance;after=token_ledger(s,wallet,"PURCHASE",package["tokens"],"PURCHASE",package["id"],f"Purchased {package['tokens']} tokens")
     add_audit(s,"billing.token_purchase",user_id=u.id,details={"package":package["id"],"tokens":package["tokens"]});s.commit()
     return {"wallet_balance":after,"credited":package["tokens"],"tokens_added":package["tokens"],"previous_balance":before,"card_last4":digits[-4:],"mode":"demo"}
+
+# ============================================================
+# VIDEO ARTIFACT ENDPOINTS
+# ============================================================
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+@app.post("/media/artifacts/upload")
+async def upload_artifact(file: UploadFile = File(...), u: User = Depends(current_user), s: Session = Depends(db)):
+    """Accept a video upload, validate it, store it durably, return artifact metadata."""
+    ext = Path(file.filename or "video.mp4").suffix.lower()
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(415, f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}")
+    content_type = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
+    if content_type not in ALLOWED_VIDEO_MIMES:
+        raise HTTPException(415, f"Unsupported MIME type '{content_type}'")
+
+    artifact_id = f"art_{secrets.token_hex(8)}"
+    art_dir = ARTIFACTS_DIR / artifact_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = sanitize_filename(file.filename or "video.mp4")
+    dest = art_dir / safe_name
+
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_VIDEO_UPLOAD_BYTES:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(413, f"File too large. Max allowed: {MAX_VIDEO_UPLOAD_BYTES // (1024*1024)} MB")
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        raise HTTPException(500, f"Upload failed: {e}")
+
+    probe = probe_video_file(dest)
+    if not probe.get("valid"):
+        dest.unlink(missing_ok=True)
+        raise HTTPException(422, f"Invalid video file: {probe.get('error', 'unknown error')}")
+
+    duration = probe.get("duration", 0) or 0
+    if duration > MAX_VIDEO_DURATION_SECONDS:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(422, f"Video too long ({duration:.1f}s). Max allowed: {MAX_VIDEO_DURATION_SECONDS}s")
+
+    checksum = _sha256_file(dest)
+    rel_path = str(Path(artifact_id) / safe_name)
+
+    art = JobArtifact(
+        id=artifact_id,
+        job_id=None,
+        user_id=u.id,
+        artifact_type="input",
+        filename=safe_name,
+        media_type=content_type,
+        file_path=rel_path,
+        size_bytes=size,
+        checksum_sha256=checksum,
+        meta_data={
+            "duration": duration,
+            "width": probe.get("width"),
+            "height": probe.get("height"),
+            "codec": probe.get("codec"),
+            "fps": probe.get("fps"),
+            "has_audio": probe.get("has_audio"),
+            "original_filename": file.filename
+        }
+    )
+    s.add(art)
+    add_audit(s, "artifact.uploaded", user_id=u.id, details={"artifact_id": artifact_id, "filename": safe_name, "size_bytes": size})
+    s.commit()
+    return {
+        "artifact_id": artifact_id,
+        "filename": safe_name,
+        "size_bytes": size,
+        "checksum_sha256": checksum,
+        "media_type": content_type,
+        "meta": art.meta_data
+    }
+
+@app.get("/media/artifacts/{artifact_id}")
+def get_artifact_meta(artifact_id: str, u: User = Depends(current_user), s: Session = Depends(db)):
+    art = s.get(JobArtifact, artifact_id)
+    if not art or art.user_id != u.id:
+        raise HTTPException(404, "Artifact not found")
+    return {
+        "artifact_id": art.id,
+        "job_id": art.job_id,
+        "filename": art.filename,
+        "size_bytes": art.size_bytes,
+        "media_type": art.media_type,
+        "checksum_sha256": art.checksum_sha256,
+        "meta": art.meta_data or {},
+        "created_at": art.created_at
+    }
+
+@app.get("/jobs/{job_id}/artifacts/{artifact_id}/download")
+def download_artifact(job_id: str, artifact_id: str, u: User = Depends(current_user), s: Session = Depends(db)):
+    """Stream a job output artifact to the authenticated job owner."""
+    j = s.get(Job, job_id)
+    if not j or j.user_id != u.id:
+        raise HTTPException(404, "Job not found")
+    art = s.get(JobArtifact, artifact_id)
+    if not art or art.job_id != job_id:
+        raise HTTPException(404, "Artifact not found")
+    if not art.file_path:
+        raise HTTPException(404, "Artifact has no stored file")
+    file_path = ARTIFACTS_DIR / art.file_path
+    if not file_path.exists():
+        raise HTTPException(404, "Artifact file missing from storage")
+    return FileResponse(
+        path=str(file_path),
+        media_type=art.media_type or "application/octet-stream",
+        filename=art.filename
+    )
+
+@app.get("/providers/jobs/{job_id}/artifacts/{artifact_id}/download")
+def provider_download_artifact(job_id: str, artifact_id: str, _ = Depends(provider_auth), s: Session = Depends(db)):
+    """Allow a provider to download an input artifact securely."""
+    j = s.get(Job, job_id)
+    if not j:
+        raise HTTPException(404, "Job not found")
+    art = s.get(JobArtifact, artifact_id)
+    if not art or art.job_id != job_id:
+        raise HTTPException(404, "Artifact not found for this job")
+    if not art.file_path:
+        raise HTTPException(404, "Artifact has no stored file")
+    file_path = ARTIFACTS_DIR / art.file_path
+    if not file_path.exists():
+        raise HTTPException(404, "Artifact file missing from storage")
+    return FileResponse(
+        path=str(file_path),
+        media_type=art.media_type or "application/octet-stream",
+        filename=art.filename
+    )
+
+@app.post("/providers/jobs/{job_id}/artifacts/upload")
+async def provider_upload_artifact(job_id: str, file: UploadFile = File(...), artifact_type: str = "output", _ = Depends(provider_auth), s: Session = Depends(db)):
+    """Provider uploads a processed output artifact for a job."""
+    j = s.get(Job, job_id)
+    if not j:
+        raise HTTPException(404, "Job not found")
+
+    artifact_id = f"art_{secrets.token_hex(8)}"
+    art_dir = ARTIFACTS_DIR / artifact_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = sanitize_filename(file.filename or f"{job_id}_output.mp4")
+    dest = art_dir / safe_name
+
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                out.write(chunk)
+    except Exception as e:
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        raise HTTPException(500, f"Upload failed: {e}")
+
+    checksum = _sha256_file(dest)
+    rel_path = str(Path(artifact_id) / safe_name)
+    content_type = (file.content_type or "video/mp4").split(";")[0].strip()
+
+    # Probe output for metadata
+    probe = probe_video_file(dest)
+
+    art = JobArtifact(
+        id=artifact_id,
+        job_id=job_id,
+        user_id=j.user_id,
+        artifact_type=artifact_type,
+        filename=safe_name,
+        media_type=content_type,
+        file_path=rel_path,
+        size_bytes=size,
+        checksum_sha256=checksum,
+        meta_data={"probe": probe}
+    )
+    s.add(art)
+    add_audit(s, "artifact.provider_upload", user_id=j.user_id, provider_id=j.provider_id, job_id=job_id,
+              details={"artifact_id": artifact_id, "size_bytes": size, "valid": probe.get("valid")})
+    s.commit()
+    return {
+        "artifact_id": artifact_id,
+        "filename": safe_name,
+        "size_bytes": size,
+        "checksum_sha256": checksum,
+        "valid": probe.get("valid"),
+        "meta": probe
+    }
+

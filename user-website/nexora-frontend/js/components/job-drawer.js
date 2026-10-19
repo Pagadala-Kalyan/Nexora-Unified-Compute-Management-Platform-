@@ -4,10 +4,10 @@
  * saved checkpoint logs, output artifacts, and cancellation controls.
  */
 
-import { apiRequest } from '../api.js';
+import { apiRequest, getApiBase, getToken } from '../api.js';
 import { state, refreshAll } from '../state.js';
 import { showToast } from './toast.js';
-import { getStatusBadgeHTML, formatDate, formatDuration, formatNumber, copyToClipboard } from '../utils/formatters.js';
+import { getStatusBadgeHTML, formatDate, formatDuration, formatNumber, formatBytes, copyToClipboard } from '../utils/formatters.js';
 import { getIcon } from '../utils/icons.js';
 
 export function openJobDrawer(jobId) {
@@ -129,6 +129,44 @@ export function openJobDrawer(jobId) {
           `}
         </div>
 
+        ${job.result?.video ? `
+        <!-- Video Compression Output Card -->
+        <div style="background: linear-gradient(135deg, rgba(0, 229, 255, 0.08), rgba(139, 92, 246, 0.08)); border: 1px solid var(--accent-cyan); border-radius: var(--radius-md); padding: var(--space-4);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-3);">
+            <div>
+              <div style="font-size: var(--text-xs); font-weight: 700; color: var(--accent-cyan); text-transform: uppercase; letter-spacing: 0.5px;">
+                Compressed Media Output
+              </div>
+              <div style="font-size: var(--text-2xs); color: var(--text-muted); font-family: var(--font-mono); margin-top: 2px;">
+                Validated FFprobe stream output · ${job.result.video.codec?.toUpperCase()} / ${job.result.video.target_resolution}
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-download-video-artifact" style="display: flex; align-items: center; gap: 6px;">
+              ${getIcon('download')}
+              Download Output Video
+            </button>
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
+            <div>
+              <div style="font-size: var(--text-2xs); color: var(--text-muted);">Original Size</div>
+              <div style="font-size: var(--text-sm); font-family: var(--font-mono); font-weight: 600; color: var(--text-primary);">${formatBytes(job.result.video.input_size_bytes)}</div>
+            </div>
+            <div>
+              <div style="font-size: var(--text-2xs); color: var(--text-muted);">Compressed Size</div>
+              <div style="font-size: var(--text-sm); font-family: var(--font-mono); font-weight: 600; color: var(--status-success);">${formatBytes(job.result.video.output_size_bytes)}</div>
+            </div>
+            <div>
+              <div style="font-size: var(--text-2xs); color: var(--text-muted);">Space Saved</div>
+              <div style="font-size: var(--text-sm); font-family: var(--font-mono); font-weight: 700; color: var(--accent-cyan);">
+                ${job.result.video.input_size_bytes > 0 ? (Math.max(0, (1 - job.result.video.output_size_bytes / job.result.video.input_size_bytes) * 100)).toFixed(1) : '0'}%
+                <span style="font-size: var(--text-2xs); font-weight: 400; color: var(--text-muted);">(${job.result.video.compression_ratio}x)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        ` : ''}
+
         <!-- Output / Execution Result Payload -->
         <div>
           <div style="font-size: var(--text-xs); font-weight: 700; color: var(--text-muted); text-transform: uppercase; margin-bottom: var(--space-2);">
@@ -188,6 +226,39 @@ export function openJobDrawer(jobId) {
         showToast(err.message || 'Failed to cancel job', 'error');
         cancelBtn.disabled = false;
         cancelBtn.textContent = 'Cancel Workload';
+      }
+    });
+  }
+
+  const downloadBtn = document.getElementById('btn-download-video-artifact');
+  if (downloadBtn && job.result?.video?.output_artifact_id) {
+    downloadBtn.addEventListener('click', async () => {
+      downloadBtn.disabled = true;
+      downloadBtn.innerHTML = `Downloading...`;
+      try {
+        const token = getToken();
+        const base = getApiBase();
+        const artifactId = job.result.video.output_artifact_id;
+        const url = `${base}/jobs/${job.id}/artifacts/${artifactId}/download`;
+        const res = await fetch(url, {
+          headers: token ? { 'Authorization': `Bearer ${token}` } : {}
+        });
+        if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
+        const blob = await res.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = `${job.name}_compressed.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(blobUrl);
+        showToast('Video downloaded successfully', 'success');
+      } catch (err) {
+        showToast(err.message || 'Failed to download artifact', 'error');
+      } finally {
+        downloadBtn.disabled = false;
+        downloadBtn.innerHTML = `${getIcon('download')} Download Output Video`;
       }
     });
   }

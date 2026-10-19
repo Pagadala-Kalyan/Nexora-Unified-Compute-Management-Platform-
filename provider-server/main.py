@@ -16,6 +16,37 @@ from datetime import datetime
 
 import psutil
 import requests
+import shutil
+from pathlib import Path
+
+
+def get_ffmpeg_binary():
+    """Locate FFmpeg: check PATH first, then imageio_ffmpeg fallback."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+def get_ffmpeg_version():
+    """Return FFmpeg version string or None if not available."""
+    binary = get_ffmpeg_binary()
+    if not binary:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        first_line = result.stdout.split("\n")[0].strip()
+        return first_line or "unknown"
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -402,6 +433,9 @@ def register():
     # separately in provider metadata if your backend
     # is extended to store it.
 
+    _ffmpeg_bin = get_ffmpeg_binary()
+    _ffmpeg_ver = get_ffmpeg_version() if _ffmpeg_bin else None
+
     data = {
 
         "id": PID,
@@ -426,7 +460,13 @@ def register():
                     "COST_PER_HOUR",
                     "0.15"
                 )
-            )
+            ),
+
+        "system_info": {
+            **SYSTEM_INFO,
+            "ffmpeg_available": bool(_ffmpeg_bin),
+            "ffmpeg_version": _ffmpeg_ver,
+        }
     }
 
     print()
@@ -455,6 +495,10 @@ def register():
     print(
         f"CUDA      : "
         f"{SYSTEM_INFO['cuda_available']}"
+    )
+    print(
+        f"FFmpeg    : "
+        f"{_ffmpeg_ver or ('Available' if _ffmpeg_bin else 'None')}"
     )
     print(
         f"OS        : "
@@ -876,6 +920,230 @@ def run_fibonacci(index, report, resume_state=None):
 
 
 # ============================================================
+# VIDEO COMPRESSION WORKLOAD
+# ============================================================
+
+COMPRESSION_PROFILES = {
+    "high":            {"crf": 20, "preset": "slow"},
+    "balanced":        {"crf": 26, "preset": "faster"},
+    "max_compression": {"crf": 32, "preset": "fast"},
+}
+CODEC_MAP = {
+    "h264": "libx264",
+    "h265": "libx265",
+    "vp9":  "libvpx-vp9",
+}
+RES_SCALE = {
+    "1080p": "scale='min(1920,iw)':-2",
+    "720p":  "scale='min(1280,iw)':-2",
+    "480p":  "scale='min(854,iw)':-2",
+}
+
+def _probe_video(path):
+    """Run ffprobe-style check via ffmpeg -i and parse stderr."""
+    import re as _re
+    binary = get_ffmpeg_binary()
+    if not binary:
+        return {"valid": False, "error": "FFmpeg not found"}
+    try:
+        proc = subprocess.run(
+            [binary, "-hide_banner", "-i", str(path)],
+            capture_output=True, text=True, timeout=15
+        )
+        out = proc.stderr
+        dur_m = _re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
+        duration = None
+        if dur_m:
+            h, m, s = float(dur_m.group(1)), float(dur_m.group(2)), float(dur_m.group(3))
+            duration = round(h * 3600 + m * 60 + s, 2)
+        vid_m = _re.search(r"Stream.*Video:\s*([a-zA-Z0-9_\-]+).*?(\d{2,5})x(\d{2,5})", out)
+        valid = bool(vid_m and duration and duration > 0)
+        return {
+            "valid": valid,
+            "duration": duration,
+            "codec": vid_m.group(1).lower() if vid_m else None,
+            "width": int(vid_m.group(2)) if vid_m else None,
+            "height": int(vid_m.group(3)) if vid_m else None,
+            "has_audio": "Audio:" in out,
+            "error": None if valid else "No valid video stream"
+        }
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+def run_video_compress(job, report_progress):
+    """
+    Download input artifact from control plane, compress with FFmpeg,
+    validate output, upload to control plane, return structured report.
+    """
+    import re as _re
+
+    binary = get_ffmpeg_binary()
+    if not binary:
+        raise RuntimeError("FFmpeg binary not found on this provider")
+
+    reqs = job["requirements"]
+    artifact_id = reqs.get("input_artifact_id")
+    if not artifact_id:
+        raise ValueError("video_compress job missing input_artifact_id")
+
+    codec_key = reqs.get("codec", "h264")
+    profile_key = reqs.get("compression_profile", "balanced")
+    target_res = reqs.get("target_resolution", "720p")
+    strip_audio = reqs.get("strip_audio", False)
+
+    encoder = CODEC_MAP.get(codec_key, "libx264")
+    profile = COMPRESSION_PROFILES.get(profile_key, COMPRESSION_PROFILES["balanced"])
+
+    jid = job["id"]
+
+    with tempfile.TemporaryDirectory(prefix=f"nexora-video-{jid}-") as workdir:
+        workdir = Path(workdir)
+
+        # --- Download input artifact ---
+        report_progress(5, {"workload": "video_compress", "stage": "downloading"})
+        dl_resp = request(
+            "GET",
+            f"/providers/jobs/{jid}/artifacts/{artifact_id}/download",
+            stream=True
+        )
+        dl_resp.raise_for_status()
+
+        cd = dl_resp.headers.get("content-disposition", "")
+        fn_match = _re.search(r'filename=["\']?([^"\'\s]+)["\']?', cd)
+        input_filename = fn_match.group(1) if fn_match else "input.mp4"
+        input_path = workdir / input_filename
+
+        with open(input_path, "wb") as f:
+            if hasattr(dl_resp, "iter_content"):
+                for chunk in dl_resp.iter_content(65536):
+                    f.write(chunk)
+            elif hasattr(dl_resp, "iter_bytes"):
+                for chunk in dl_resp.iter_bytes(65536):
+                    f.write(chunk)
+            else:
+                f.write(dl_resp.content)
+
+        print(f"[VIDEO] Downloaded input: {input_path} ({input_path.stat().st_size} bytes)")
+
+        # --- Validate input ---
+        probe_in = _probe_video(input_path)
+        if not probe_in["valid"]:
+            raise ValueError(f"Input video invalid: {probe_in.get('error')}")
+
+        input_size = input_path.stat().st_size
+        duration = probe_in.get("duration", 0) or 0
+
+        # --- Build FFmpeg command using argument array ---
+        output_path = workdir / f"{jid}_output.mp4"
+        vf_filters = []
+        if target_res in RES_SCALE and target_res != "original":
+            vf_filters.append(RES_SCALE[target_res])
+
+        cmd = [binary, "-y", "-i", str(input_path)]
+
+        if vf_filters:
+            cmd += ["-vf", ",".join(vf_filters)]
+
+        cmd += ["-c:v", encoder]
+
+        if encoder in ("libx264", "libx265"):
+            cmd += ["-crf", str(profile["crf"]), "-preset", profile["preset"]]
+        elif encoder == "libvpx-vp9":
+            cmd += ["-crf", str(profile["crf"]), "-b:v", "0"]
+
+        if strip_audio:
+            cmd += ["-an"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+
+        cmd += ["-movflags", "+faststart"]
+        cmd += ["-progress", "pipe:1", "-nostats"]
+        cmd += [str(output_path)]
+
+        print(f"[VIDEO] Running FFmpeg: {' '.join(cmd)}")
+        report_progress(10, {"workload": "video_compress", "stage": "encoding", "input_duration": duration})
+
+        # --- Execute FFmpeg with stdout progress parsing ---
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # Prevent pipe deadlock
+            text=True
+        )
+
+        last_reported = 10
+        total_us = duration * 1_000_000 if duration > 0 else 1
+
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_us="):
+                try:
+                    out_time_us = int(line.split("=", 1)[1])
+                    pct = min(90, 10 + int(80 * out_time_us / total_us))
+                    if pct > last_reported + 4:
+                        report_progress(pct, {
+                            "workload": "video_compress",
+                            "stage": "encoding",
+                            "progress_pct": pct,
+                            "out_time_us": out_time_us
+                        })
+                        last_reported = pct
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg exited with code {proc.returncode}")
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg produced no output file")
+
+        # --- Validate output ---
+        report_progress(92, {"workload": "video_compress", "stage": "validating"})
+        probe_out = _probe_video(output_path)
+        if not probe_out["valid"]:
+            raise RuntimeError(f"Output video invalid after encoding: {probe_out.get('error')}")
+
+        output_size = output_path.stat().st_size
+        compression_ratio = round(input_size / max(output_size, 1), 3)
+
+        print(f"[VIDEO] Output validated: {output_size} bytes, ratio {compression_ratio}x")
+
+        # --- Upload output artifact to control plane ---
+        report_progress(95, {"workload": "video_compress", "stage": "uploading"})
+        with open(output_path, "rb") as fp:
+            up_resp = request(
+                "POST",
+                f"/providers/jobs/{jid}/artifacts/upload",
+                files={
+                    "file": (output_path.name, fp, "video/mp4")
+                },
+                params={"artifact_type": "output"}
+            )
+        up_resp.raise_for_status()
+        upload_meta = up_resp.json()
+
+        output_artifact_id = upload_meta["artifact_id"]
+        print(f"[VIDEO] Output artifact uploaded: {output_artifact_id}")
+
+    return {
+        "operation": "video_compress",
+        "input_artifact_id": artifact_id,
+        "output_artifact_id": output_artifact_id,
+        "input_size_bytes": input_size,
+        "output_size_bytes": output_size,
+        "compression_ratio": compression_ratio,
+        "codec": codec_key,
+        "profile": profile_key,
+        "target_resolution": target_res,
+        "duration_seconds": duration,
+        "input_probe": probe_in,
+        "output_probe": probe_out,
+    }
+
+
+# ============================================================
 # JOB EXECUTION
 # ============================================================
 
@@ -990,6 +1258,10 @@ def execute(job):
                 resume_state=resume_state
             )
 
+        elif workload == "video_compress":
+            video_result = run_video_compress(job, report)
+            total = video_result
+
         elif workload == "custom_python":
             # Stage 6: Documented Custom Python Recovery Strategy
             # Arbitrary OS subprocess execution state cannot be safely serialized across
@@ -1064,7 +1336,8 @@ def execute(job):
             "matrix_multiply": "Matrix computation completed",
             "prime_search": "Prime search completed",
             "fibonacci": "Fibonacci computation completed",
-            "custom_python": "Uploaded Python code completed"
+            "custom_python": "Uploaded Python code completed",
+            "video_compress": "Video compression completed"
         }.get(
             workload,
             "Workload completed"
@@ -1087,8 +1360,9 @@ def execute(job):
                 "result": {
                     "message": message,
                     "workload": workload,
-                    "input_size": size,
+                    "input_size": size if workload != "video_compress" else None,
                     "output": total,
+                    "video": total if isinstance(total, dict) and total.get("operation") == "video_compress" else None,
                     "provider": PID,
                     "attempt": attempt,
                     "recovered": is_recovery,

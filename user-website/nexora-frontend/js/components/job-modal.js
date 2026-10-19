@@ -4,7 +4,7 @@
  * and compatible provider matching.
  */
 
-import { apiRequest } from '../api.js';
+import { apiRequest, uploadArtifact } from '../api.js';
 import { state, refreshAll } from '../state.js';
 import { showToast } from './toast.js';
 import { formatNumber } from '../utils/formatters.js';
@@ -46,6 +46,7 @@ export function openJobModal() {
               <label class="form-label" for="job-workload">Compute Algorithm / Workload Type</label>
               <select id="job-workload" class="select">
                 <option value="matrix_multiply" selected>Matrix Multiplication (PyTorch · CUDA / CPU)</option>
+                <option value="video_compress">Video Compression (FFmpeg · Multi-codec Pipeline)</option>
                 <option value="prime_search">Distributed Prime Search (CPU Partitions)</option>
                 <option value="fibonacci">Fibonacci Deep Iteration (Sequential CPU)</option>
                 <option value="custom_python">Custom Python Code (Sandboxed Subprocess)</option>
@@ -181,6 +182,61 @@ print(f"Computed total checksum: {total:.4f}")
         </div>
       `;
       document.getElementById('custom-py-code').addEventListener('input', updateEstimates);
+    } else if (val === 'video_compress') {
+      specificContainer.innerHTML = `
+        <div class="form-group">
+          <label class="form-label" for="video-file-input">Select Source Video File</label>
+          <input type="file" id="video-file-input" class="input" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv" required />
+          <div class="form-help" id="video-file-help">Supported formats: MP4, MOV, WebM, MKV (max 50 MB, 5 min duration).</div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); margin-bottom: var(--space-3);">
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label" for="video-codec">Encoding Codec</label>
+            <select id="video-codec" class="select">
+              <option value="h264" selected>H.264 / AVC (Broadest Compatibility)</option>
+              <option value="h265">H.265 / HEVC (High Efficiency)</option>
+              <option value="vp9">VP9 (Open Web Standard)</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label" for="video-profile">Quality Profile</label>
+            <select id="video-profile" class="select">
+              <option value="balanced" selected>Balanced (CRF 26 · Recommended)</option>
+              <option value="high">High Quality (CRF 20)</option>
+              <option value="max_compression">Maximum Compression (CRF 32)</option>
+            </select>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); margin-bottom: var(--space-3);">
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label" for="video-resolution">Target Resolution</label>
+            <select id="video-resolution" class="select">
+              <option value="720p" selected>720p (HD Scale · max 1280w)</option>
+              <option value="1080p">1080p (Full HD Scale · max 1920w)</option>
+              <option value="480p">480p (SD Scale · max 854w)</option>
+              <option value="original">Original Aspect & Resolution</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin-bottom: 0; display: flex; align-items: center; padding-top: 22px;">
+            <label style="display: flex; align-items: center; gap: 8px; font-size: var(--text-xs); color: var(--text-primary); cursor: pointer;">
+              <input type="checkbox" id="video-strip-audio" style="accent-color: var(--accent-cyan);" />
+              Strip Audio Track (-an)
+            </label>
+          </div>
+        </div>
+      `;
+      const fileInput = document.getElementById('video-file-input');
+      const fileHelp = document.getElementById('video-file-help');
+      fileInput.addEventListener('change', () => {
+        if (fileInput.files.length > 0) {
+          const f = fileInput.files[0];
+          const mb = (f.size / (1024 * 1024)).toFixed(2);
+          fileHelp.textContent = `Selected: ${f.name} (${mb} MB)`;
+          fileHelp.style.color = 'var(--accent-cyan)';
+        }
+        updateEstimates();
+      });
+      document.getElementById('video-resolution').addEventListener('change', updateEstimates);
     }
     updateEstimates();
   }
@@ -196,6 +252,7 @@ print(f"Computed total checksum: {total:.4f}")
       if (p.cpu_cores < cpu) return false;
       if (p.ram_gb < ram) return false;
       if (gpuReq && (!p.gpu_name || p.gpu_memory_gb <= 0)) return false;
+      if (workload === 'video_compress' && !p.system_info?.ffmpeg_available) return false;
       return true;
     });
 
@@ -205,18 +262,20 @@ print(f"Computed total checksum: {total:.4f}")
       compatibleDisplay.innerHTML = `<span style="color: var(--status-success);">${matching.length} Available Node${matching.length > 1 ? 's' : ''}</span>`;
     }
 
-    // Backend estimation formula:
-    // hours = max(requirements.expected_runtime_hours, 0.01)
-    // multiplier = 8 if gpu else 2 (or 10 if torch in python_code)
-    // tokens = max(1, round(hours * 60 * multiplier + max(0, ram - 4) * 0.1))
-    let expectedHours = 0.05;
-    let multiplier = gpuReq ? 8 : 2;
-    if (workload === 'custom_python') {
-      const code = document.getElementById('custom-py-code')?.value || '';
-      if (code.includes('torch')) multiplier = 10;
+    let estimatedTokens;
+    if (workload === 'video_compress') {
+      const res = document.getElementById('video-resolution')?.value || '720p';
+      const mult = { '1080p': 3, '720p': 2, '480p': 1, 'original': 2 }[res] || 2;
+      estimatedTokens = Math.max(5, Math.round(60 * mult * 0.5 + 10));
+    } else {
+      let expectedHours = 0.05;
+      let multiplier = gpuReq ? 8 : 2;
+      if (workload === 'custom_python') {
+        const code = document.getElementById('custom-py-code')?.value || '';
+        if (code.includes('torch')) multiplier = 10;
+      }
+      estimatedTokens = Math.max(1, Math.round(expectedHours * 60 * multiplier + Math.max(0, ram - 4) * 0.1));
     }
-
-    const estimatedTokens = Math.max(1, Math.round(expectedHours * 60 * multiplier + Math.max(0, ram - 4) * 0.1));
     estimateDisplay.textContent = `${estimatedTokens} Tokens`;
 
     if (userBalance < estimatedTokens) {
@@ -242,7 +301,7 @@ print(f"Computed total checksum: {total:.4f}")
     e.preventDefault();
     const { estimatedTokens, matching } = updateEstimates();
     if (matching.length === 0) {
-      showToast('No compatible online provider matches the requested CPU/RAM/GPU requirements.', 'error');
+      showToast('No compatible online provider matches the requested requirements.', 'error');
       return;
     }
 
@@ -268,9 +327,33 @@ print(f"Computed total checksum: {total:.4f}")
       requirements.python_code = document.getElementById('custom-py-code').value;
       requirements.timeout_seconds = Number(document.getElementById('py-timeout').value) || 20;
       requirements.file_name = `${name.replace(/\s+/g, '_')}.py`;
+    } else if (workload === 'video_compress') {
+      const fileInput = document.getElementById('video-file-input');
+      if (!fileInput || fileInput.files.length === 0) {
+        showToast('Please select a video file to compress.', 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Dispatch to Cluster';
+        return;
+      }
+      submitBtn.textContent = 'Uploading Video Artifact...';
+      try {
+        const art = await uploadArtifact(fileInput.files[0]);
+        requirements.input_artifact_id = art.artifact_id;
+        requirements.codec = document.getElementById('video-codec').value;
+        requirements.compression_profile = document.getElementById('video-profile').value;
+        requirements.target_resolution = document.getElementById('video-resolution').value;
+        requirements.strip_audio = document.getElementById('video-strip-audio').checked;
+        requirements.input_duration_seconds = art.meta?.duration || 60;
+      } catch (uploadErr) {
+        showToast(uploadErr.message || 'Video upload failed', 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Dispatch to Cluster';
+        return;
+      }
     }
 
     try {
+      submitBtn.textContent = 'Scheduling & Reserving Tokens...';
       const job = await apiRequest('/jobs', {
         method: 'POST',
         body: JSON.stringify({

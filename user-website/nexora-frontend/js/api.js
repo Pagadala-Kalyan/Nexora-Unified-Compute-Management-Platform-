@@ -56,8 +56,9 @@ export async function apiRequest(path, options = {}) {
   const token = getToken();
   const url = `${apiBase}${path.startsWith('/') ? path : '/' + path}`;
   
+  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
   const headers = {
-    'Content-Type': 'application/json',
+    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
     ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
     ...(options.headers || {})
   };
@@ -128,4 +129,14 @@ export async function apiRequest(path, options = {}) {
   }
 
   return data;
+}
+
+export async function uploadArtifact(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  return apiRequest('/media/artifacts/upload', {
+    method: 'POST',
+    body: formData,
+    timeout: 120000 // 2 min timeout for video upload
+  });
 }
