@@ -1,7 +1,10 @@
 {
   "framework": null,
-  "installCommand": "cd user-website/frontend-vite-backup && npm install",
-  "buildCommand": "cd user-website/frontend-vite-backup && npm run build",
-  "outputDirectory": "user-website/frontend-vite-backup/dist",
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+  "installCommand": "echo 'No install required'",
+  "buildCommand": "echo 'Build complete'",
+  "outputDirectory": "user-website/nexora-frontend",
+  "cleanUrls": true,
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
 }
