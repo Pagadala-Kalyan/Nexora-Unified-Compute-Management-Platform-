@@ -1,63 +1,96 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-if not exist ".venv\Scripts\python.exe" (
+echo.
+echo ============================================================
+echo         NEXORA PROVIDER SERVER  —  start.bat
+echo ============================================================
+echo.
+echo  Usage:
+echo    start.bat              Auto-detect backend (local then cloud)
+echo    start.bat --online     Force cloud backend
+echo    start.bat --local      Force local backend (127.0.0.1:8000)
+echo    start.bat --url URL    Use a custom backend URL
+echo    start.bat --token TOK  Override the provider shared token
+echo.
+echo  Environment overrides (optional):
+echo    PROVIDER_SHARED_TOKEN  Auth token  (default: local-demo-token)
+echo    COST_PER_HOUR          Billing rate (default: 0.15)
+echo.
+echo ============================================================
+echo.
+
+REM ─── Default token (matches Render env var and backend fallback) ─────────────
+if not defined PROVIDER_SHARED_TOKEN (
+    set "PROVIDER_SHARED_TOKEN=local-demo-token"
+)
+
+REM ─── Locate Python ───────────────────────────────────────────────────────────
+set "PYTHON="
+
+if exist ".venv\Scripts\python.exe" (
+    set "PYTHON=.venv\Scripts\python.exe"
+    echo [PYTHON] Using virtual environment: .venv\Scripts\python.exe
+) else (
+    echo [INFO] No virtual environment found at .venv\Scripts\python.exe
+    echo [INFO] Checking for system Python...
+    where python >nul 2>&1
+    if !errorlevel!==0 (
+        set "PYTHON=python"
+        echo [PYTHON] Using system Python.
+    ) else (
+        where py >nul 2>&1
+        if !errorlevel!==0 (
+            set "PYTHON=py"
+            echo [PYTHON] Using py launcher.
+        )
+    )
+)
+
+if not defined PYTHON (
     echo.
-    echo Python virtual environment not found at .venv\Scripts\python.exe
+    echo [ERROR] Python not found. Install Python 3.10+ or create a venv:
     echo.
-    echo Create it with:
     echo   py -m venv .venv
-    echo.
-    echo Then install packages with:
     echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
     echo.
     pause
     exit /b 1
 )
 
-REM ============================================================
-REM Nexora Provider Configuration
-REM ============================================================
-
-REM Local backend used by the current application/dashboard
-set "UCMP_BACKEND_URL=http://127.0.0.1:8000"
-set "PROVIDER_SHARED_TOKEN=local-demo-token"
-
-echo.
-echo ============================================
-echo       Nexora Provider
-echo ============================================
-echo.
-echo [BACKEND] %UCMP_BACKEND_URL%
-echo [AUTH]    Local provider authentication
-echo.
-
-REM Check whether the local backend is reachable.
-curl --silent --head --max-time 5 "%UCMP_BACKEND_URL%" >nul 2>&1
-
-if not %errorlevel%==0 (
-    echo [ERROR] Nexora local backend is not reachable.
+REM ─── Install / check requirements ────────────────────────────────────────────
+if not exist ".venv\Scripts\python.exe" (
     echo.
-    echo Please start the backend first, then run this provider again.
+    echo [TIP] Consider creating a virtual environment for isolation:
+    echo   py -m venv .venv
+    echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
     echo.
-    echo Expected backend:
-    echo   %UCMP_BACKEND_URL%
-    echo.
-    pause
-    exit /b 1
+) else (
+    REM Check if requirements are installed (look for requests as a proxy)
+    ".venv\Scripts\python.exe" -c "import requests" >nul 2>&1
+    if not !errorlevel!==0 (
+        echo [SETUP] Installing requirements into virtual environment...
+        ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+        if not !errorlevel!==0 (
+            echo [ERROR] pip install failed. Check requirements.txt and your internet connection.
+            pause
+            exit /b 1
+        )
+        echo [SETUP] Requirements installed.
+        echo.
+    )
 )
 
-echo [OK] Backend is reachable.
-echo.
-echo Starting Nexora Provider...
+REM ─── Launch provider with all CLI args forwarded ─────────────────────────────
+echo [START] Launching provider server...
 echo.
 
-".venv\Scripts\python.exe" .\main.py
+"%PYTHON%" main.py %*
 
 echo.
-echo ============================================
-echo Provider stopped.
-echo ============================================
+echo ============================================================
+echo  Provider stopped.
+echo ============================================================
 echo.
 pause
