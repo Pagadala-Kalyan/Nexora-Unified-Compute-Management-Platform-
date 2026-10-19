@@ -3,5 +3,7 @@
 __pycache__/
 *.py[cod]
 nexora.db
+*.db
+*.bak
 node_modules/
 dist/

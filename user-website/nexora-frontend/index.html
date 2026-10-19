@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="quantum-neon">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#07090F" />
+  <meta name="description" content="Nexora Unified Compute Management Platform — One Platform. Any Compute. Intelligent Execution." />
+  <title>Nexora UCMP — Intelligent Compute Orchestration</title>
+  
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+
+  <!-- Google Fonts: Plus Jakarta Sans (Display/Headings), Inter (UI), and JetBrains Mono (Code) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- Nexora Design System Stylesheets -->
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/base.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+  <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/animations.css" />
+  <link rel="stylesheet" href="css/pages.css" />
+  <link rel="stylesheet" href="css/landing.css" />
+  <link rel="stylesheet" href="css/dashboard.css" />
+</head>
+<body>
+  <div id="app-root">
+    <!-- Backdrop for Mobile Navigation -->
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <!-- Persistent Sidebar Container -->
+    <div id="sidebar-container"></div>
+
+    <!-- Main Viewport -->
+    <div class="app-main-viewport">
+      <!-- Topbar Navigation Container -->
+      <div id="topbar-container"></div>
+
+      <!-- Main Scrollable Content -->
+      <main id="page-content" class="app-content" role="main"></main>
+    </div>
+  </div>
+
+  <!-- Interactive Containers for Overlays, Drawers & Modals -->
+  <div id="auth-modal-wrap"></div>
+  <div id="job-modal-wrap"></div>
+  <div id="job-drawer-wrap"></div>
+  <div id="purchase-modal-wrap"></div>
+
+  <!-- Application Bootstrap -->
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

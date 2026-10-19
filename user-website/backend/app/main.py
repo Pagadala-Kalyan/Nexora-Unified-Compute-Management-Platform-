@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import secrets
 import threading
@@ -14,7 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nexora.db")
@@ -39,6 +40,10 @@ def verify_password(password: str, encoded: str) -> bool:
         return secrets.compare_digest(actual.hex(), expected)
     except (ValueError, AttributeError): return False
 
+def canonical_hash(obj: dict) -> str:
+    raw = json.dumps(obj, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
 class Base(DeclarativeBase): pass
 class JobStatus(str, Enum): QUEUED="QUEUED"; SCHEDULED="SCHEDULED"; RUNNING="RUNNING"; COMPLETED="COMPLETED"; FAILED="FAILED"; RECOVERING="RECOVERING"; CANCELLED="CANCELLED"
 class Provider(Base):
@@ -53,10 +58,14 @@ class User(Base):
 class Job(Base):
     __tablename__="jobs"; id: Mapped[str]=mapped_column(String, primary_key=True); name: Mapped[str]=mapped_column(String); workload: Mapped[str]=mapped_column(String)
     requirements: Mapped[dict]=mapped_column(JSON, default=dict); status: Mapped[str]=mapped_column(String, default="QUEUED"); progress: Mapped[int]=mapped_column(Integer, default=0)
-    user_id: Mapped[int]=mapped_column(ForeignKey("users.id")); provider_id: Mapped[Optional[str]]=mapped_column(ForeignKey("providers.id"), nullable=True); result: Mapped[Optional[dict]]=mapped_column(JSON, nullable=True)
+    user_id: Mapped[int]=mapped_column(ForeignKey("users.id")); provider_id: Mapped[Optional[str]]=mapped_column(ForeignKey("providers.id"), nullable=True)
+    attempt: Mapped[int]=mapped_column(Integer, default=1); recovery_count: Mapped[int]=mapped_column(Integer, default=0)
+    result: Mapped[Optional[dict]]=mapped_column(JSON, nullable=True)
     estimated_cost: Mapped[float]=mapped_column(Float, default=0); actual_cost: Mapped[float]=mapped_column(Float, default=0); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)); started_at: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True); completed_at: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True)
 class Checkpoint(Base):
-    __tablename__="checkpoints"; id: Mapped[str]=mapped_column(String, primary_key=True); job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id")); provider_id: Mapped[str]=mapped_column(String); progress: Mapped[int]=mapped_column(Integer); payload: Mapped[dict]=mapped_column(JSON, default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __tablename__="checkpoints"; id: Mapped[str]=mapped_column(String, primary_key=True); job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id")); provider_id: Mapped[str]=mapped_column(String)
+    attempt: Mapped[int]=mapped_column(Integer, default=1); seq: Mapped[int]=mapped_column(Integer, default=1); progress: Mapped[int]=mapped_column(Integer)
+    state_version: Mapped[int]=mapped_column(Integer, default=1); state_hash: Mapped[str]=mapped_column(String, default=""); payload: Mapped[dict]=mapped_column(JSON, default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class AuthSession(Base):
     __tablename__="auth_sessions"
     id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True)
@@ -64,7 +73,7 @@ class AuthSession(Base):
 class JobArtifact(Base):
     __tablename__="job_artifacts"
     id: Mapped[str]=mapped_column(String, primary_key=True); job_id: Mapped[str]=mapped_column(ForeignKey("jobs.id"), index=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True)
-    filename: Mapped[str]=mapped_column(String); media_type: Mapped[str]=mapped_column(String, default="text/x-python"); content: Mapped[str]=mapped_column(Text); size_bytes: Mapped[int]=mapped_column(Integer); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    filename: Mapped[str]=mapped_column(String); media_type: Mapped[str]=mapped_column(String, default="text/x-python"); content: Mapped[Text]=mapped_column(Text); size_bytes: Mapped[int]=mapped_column(Integer); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 class BillingTransaction(Base):
     __tablename__="billing_transactions"
     id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True)
@@ -90,7 +99,7 @@ class Login(Register): pass
 class JobCreate(BaseModel): name: str = Field(min_length=2, max_length=100); workload: str = "matrix_multiply"; requirements: dict = Field(default_factory=dict)
 class ProviderRegister(BaseModel): id: str; name: str; cpu_cores: int = Field(ge=1); ram_gb: float = Field(gt=0); gpu_name: Optional[str]=None; gpu_memory_gb: float=0; cost_per_hour: float=.25
 class Heartbeat(BaseModel): status: str="ONLINE"; utilization: dict=Field(default_factory=dict)
-class Update(BaseModel): status: Optional[JobStatus]=None; progress: Optional[int]=Field(None, ge=0, le=100); result: Optional[dict]=None; actual_cost: Optional[float]=None
+class Update(BaseModel): status: Optional[JobStatus]=None; progress: Optional[int]=Field(None, ge=0, le=100); result: Optional[dict]=None; actual_cost: Optional[float]=None; attempt: Optional[int]=None
 class DemoTopUp(BaseModel): amount: float = Field(gt=0, le=10000); card_number: str = Field(min_length=12, max_length=23); cardholder: str = Field(min_length=2, max_length=80); expiry: str = Field(min_length=4, max_length=7); cvc: str = Field(min_length=3, max_length=4)
 class TokenPurchase(BaseModel): package_id: str
 
@@ -149,13 +158,21 @@ def provider_auth(x_provider_token: str=Header(...)):
     if not secrets.compare_digest(x_provider_token, PROVIDER_TOKEN): raise HTTPException(401,"Provider authentication failed")
 def job_data(j, s=None):
     bill=s.get(JobBilling,j.id) if s else None
-    return {"id":j.id,"name":j.name,"workload":j.workload,"requirements":j.requirements,"status":j.status,"progress":j.progress,"provider_id":j.provider_id,"result":j.result,"estimated_cost":j.estimated_cost,"actual_cost":j.actual_cost,"estimated_tokens":bill.estimated_tokens if bill else 0,"reserved_tokens":bill.reserved_tokens if bill else 0,"actual_tokens":bill.actual_tokens if bill else None,"created_at":j.created_at}
+    return {
+        "id":j.id,"name":j.name,"workload":j.workload,"requirements":j.requirements,
+        "status":j.status,"progress":j.progress,"provider_id":j.provider_id,
+        "attempt": getattr(j, "attempt", 1) or 1,
+        "recovery_count": getattr(j, "recovery_count", 0) or 0,
+        "result":j.result,"estimated_cost":j.estimated_cost,"actual_cost":j.actual_cost,
+        "estimated_tokens":bill.estimated_tokens if bill else 0,"reserved_tokens":bill.reserved_tokens if bill else 0,
+        "actual_tokens":bill.actual_tokens if bill else None,"created_at":j.created_at
+    }
 def provider_data(p): return {"id":p.id,"name":p.name,"cpu_cores":p.cpu_cores,"ram_gb":p.ram_gb,"gpu_name":p.gpu_name,"gpu_memory_gb":p.gpu_memory_gb,"cost_per_hour":p.cost_per_hour,"status":p.status,"reliability":p.reliability,"utilization":p.utilization,"last_heartbeat":p.last_heartbeat}
 def compatible_provider(s, requirements, exclude_id=None):
     candidates=[p for p in s.query(Provider).all() if p.id!=exclude_id and p.status in ("ONLINE","AVAILABLE") and p.cpu_cores>=requirements.get("cpu_cores",1) and p.ram_gb>=requirements.get("ram_gb",1) and (not requirements.get("gpu_required") or p.gpu_name)]
     return min(candidates,key=lambda x:x.cost_per_hour/(max(x.reliability,1)/100)) if candidates else None
 def recover_lost_providers():
-    """Detect provider loss and re-dispatch checkpointed controlled workloads."""
+    """Detect provider loss and re-dispatch checkpointed controlled workloads with generation fencing."""
     while True:
         time.sleep(5)
         s=SessionLocal()
@@ -166,21 +183,58 @@ def recover_lost_providers():
                 if (now-last).total_seconds() <= int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS","20")): continue
                 failed.status="OFFLINE"
                 for j in s.query(Job).filter(Job.provider_id==failed.id,Job.status.in_(["SCHEDULED","RUNNING"])).all():
-                    checkpoint=s.query(Checkpoint).filter_by(job_id=j.id).order_by(Checkpoint.created_at.desc()).first()
+                    checkpoint=s.query(Checkpoint).filter_by(job_id=j.id).order_by(Checkpoint.seq.desc(), Checkpoint.created_at.desc()).first()
                     replacement=compatible_provider(s,j.requirements,failed.id)
-                    if checkpoint and replacement:
-                        j.provider_id=replacement.id; j.status="RECOVERING"; j.progress=checkpoint.progress
-                        j.requirements={**j.requirements,"resume_from_progress":checkpoint.progress,"recovery_note":f"Recovered from {failed.name}"}; replacement.status="BUSY"
+                    if replacement:
+                        current_attempt = getattr(j, "attempt", 1) or 1
+                        j.attempt = current_attempt + 1
+                        j.recovery_count = (getattr(j, "recovery_count", 0) or 0) + 1
+                        j.provider_id = replacement.id
+                        j.status = "RECOVERING"
+                        j.progress = checkpoint.progress if checkpoint else 0
+                        j.requirements = {
+                            **j.requirements,
+                            "resume_from_progress": checkpoint.progress if checkpoint else 0,
+                            "resume_checkpoint_id": checkpoint.id if checkpoint else None,
+                            "resume_attempt": j.attempt,
+                            "recovery_note": f"Recovered from {failed.name} to {replacement.name} (attempt {j.attempt})"
+                        }
+                        replacement.status = "BUSY"
+                        add_audit(s, "job.recovered", user_id=j.user_id, provider_id=replacement.id, job_id=j.id,
+                                  details={"failed_provider": failed.id, "new_provider": replacement.id, "attempt": j.attempt, "checkpoint_id": checkpoint.id if checkpoint else None})
                     else:
-                        j.status="FAILED"; j.result={"error":"Provider lost; no compatible recovery provider or checkpoint available."}; refund_reservation(s,j,f"Refund after provider loss for {j.name}")
+                        j.status="FAILED"
+                        j.result={"error":"Provider lost; no compatible recovery provider or checkpoint available."}
+                        refund_reservation(s,j,f"Refund after provider loss for {j.name}")
+                        add_audit(s, "job.failed_unrecoverable", user_id=j.user_id, provider_id=failed.id, job_id=j.id,
+                                  details={"failed_provider": failed.id})
             s.commit()
+        except Exception as ex:
+            print(f"[RECOVERY MONITOR ERROR] {ex}")
         finally: s.close()
+
+def ensure_schema_columns(s):
+    try:
+        bind = s.get_bind()
+        if bind.dialect.name == "sqlite":
+            for table, cols in [
+                ("jobs", [("attempt", "INTEGER DEFAULT 1"), ("recovery_count", "INTEGER DEFAULT 0")]),
+                ("checkpoints", [("seq", "INTEGER DEFAULT 1"), ("attempt", "INTEGER DEFAULT 1"), ("state_version", "INTEGER DEFAULT 1"), ("state_hash", "TEXT DEFAULT ''")])
+            ]:
+                existing = [r[1] for r in s.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+                for col_name, col_def in cols:
+                    if col_name not in existing:
+                        s.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}"))
+            s.commit()
+    except Exception as ex:
+        print(f"[SCHEMA MIGRATION WARNING] {ex}")
 
 @app.on_event("startup")
 def init():
     Base.metadata.create_all(engine)
     s=SessionLocal()
     try:
+        ensure_schema_columns(s)
         for user in s.query(User).all(): wallet_for(s,user.id)
         s.commit()
     finally: s.close()
@@ -257,34 +311,142 @@ def pending(provider_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
 def update_job(job_id:str,body:Update,_=Depends(provider_auth),s:Session=Depends(db)):
     j=s.get(Job,job_id)
     if not j: raise HTTPException(404,"Job not found")
+
+    # FENCING TOKEN CHECK: Reject updates from stale attempts
+    current_attempt = getattr(j, "attempt", 1) or 1
+    if body.attempt is not None and body.attempt != current_attempt:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Stale execution attempt rejected. Job is at attempt {current_attempt}, received {body.attempt}.",
+                "current_attempt": current_attempt,
+                "received_attempt": body.attempt
+            }
+        )
+
     if body.status: j.status=body.status.value
-    if body.progress is not None:j.progress=body.progress
-    if body.result is not None:j.result=body.result
-    if body.actual_cost is not None:j.actual_cost=body.actual_cost
-    if j.status=="RUNNING" and not j.started_at:j.started_at=datetime.now(timezone.utc)
+    if body.progress is not None: j.progress=body.progress
+    if body.result is not None: j.result=body.result
+    if body.actual_cost is not None: j.actual_cost=body.actual_cost
+    if j.status=="RUNNING" and not j.started_at: j.started_at=datetime.now(timezone.utc)
     if j.status in ("COMPLETED","FAILED","CANCELLED"):
-        j.completed_at=datetime.now(timezone.utc);p=s.get(Provider,j.provider_id);p.status="ONLINE"
-        bill=s.get(JobBilling,j.id);wallet=wallet_for(s,j.user_id)
-        if bill and bill.reserved_tokens:
-            # Provider's reported duration becomes the deterministic actual token use.
+        j.completed_at=datetime.now(timezone.utc)
+        p=s.get(Provider,j.provider_id)
+        if p: p.status="ONLINE"
+        bill=s.get(JobBilling,j.id)
+        wallet=wallet_for(s,j.user_id)
+        # Idempotent settlement: only execute if tokens are still reserved
+        if bill and bill.reserved_tokens > 0:
             elapsed=(body.result or {}).get("elapsed_seconds") if body.result else None
             actual=min(bill.reserved_tokens,max(1,int(round(float(elapsed or 0)*2)))) if j.status=="COMPLETED" else 0
-            reserved=bill.reserved_tokens; bill.actual_tokens=actual; bill.reserved_tokens=0
-            # Close the reservation, then write the actual charge as its own ledger entry.
+            reserved=bill.reserved_tokens
+            bill.actual_tokens=actual
+            bill.reserved_tokens=0
             token_ledger(s,wallet,"JOB_REFUND",reserved,"JOB",j.id,f"Reservation settlement for {j.name}",j.id)
             if actual: token_ledger(s,wallet,"JOB_USAGE",-actual,"JOB",j.id,f"Compute usage for {j.name}",j.id)
-    s.commit();return job_data(j,s)
+    s.commit()
+    return job_data(j,s)
+
 @app.post("/providers/jobs/{job_id}/checkpoint")
 def checkpoint(job_id:str,body:dict,_=Depends(provider_auth),s:Session=Depends(db)):
     j=s.get(Job,job_id)
     if not j: raise HTTPException(404,"Job not found")
-    c=Checkpoint(id=f"cp_{secrets.token_hex(5)}",job_id=job_id,provider_id=j.provider_id,progress=int(body.get("progress",0)),payload=body);s.add(c);s.commit();return {"id":c.id,"progress":c.progress}
+
+    # FENCING TOKEN CHECK: Reject checkpoints from stale attempts
+    current_attempt = getattr(j, "attempt", 1) or 1
+    req_attempt = int(body.get("attempt", current_attempt))
+    if req_attempt != current_attempt:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Stale checkpoint rejected. Job is at attempt {current_attempt}, received {req_attempt}.",
+                "current_attempt": current_attempt,
+                "received_attempt": req_attempt
+            }
+        )
+
+    # Sequence numbering
+    highest_seq = s.query(Checkpoint.seq).filter_by(job_id=job_id).order_by(Checkpoint.seq.desc()).first()
+    next_seq = (highest_seq[0] + 1) if highest_seq and highest_seq[0] is not None else 1
+    seq = int(body.get("seq", next_seq))
+
+    # Integrity verification
+    state_payload = body.get("state", {})
+    state_version = int(body.get("state_version", 1))
+    computed_hash = canonical_hash(state_payload) if state_payload else ""
+    received_hash = body.get("state_hash", computed_hash)
+    if received_hash and computed_hash and received_hash != computed_hash:
+        raise HTTPException(422, detail={"message": "Checkpoint integrity hash mismatch", "computed": computed_hash, "received": received_hash})
+
+    progress = int(body.get("progress", j.progress))
+    c=Checkpoint(
+        id=f"cp_{secrets.token_hex(5)}",
+        job_id=job_id,
+        provider_id=j.provider_id or body.get("provider_id") or "unknown",
+        attempt=req_attempt,
+        seq=seq,
+        progress=progress,
+        state_version=state_version,
+        state_hash=received_hash or computed_hash,
+        payload=state_payload or body
+    )
+    s.add(c)
+    j.progress = progress
+    s.commit()
+    return {
+        "id": c.id,
+        "seq": c.seq,
+        "attempt": c.attempt,
+        "progress": c.progress,
+        "state_hash": c.state_hash
+    }
+
+@app.get("/providers/jobs/{job_id}/checkpoint/latest")
+def get_latest_checkpoint(job_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
+    j=s.get(Job,job_id)
+    if not j: raise HTTPException(404,"Job not found")
+    c=s.query(Checkpoint).filter_by(job_id=job_id).order_by(Checkpoint.seq.desc(), Checkpoint.created_at.desc()).first()
+    if not c:
+        return {"checkpoint": None}
+    return {
+        "checkpoint": {
+            "id": c.id,
+            "job_id": c.job_id,
+            "provider_id": c.provider_id,
+            "attempt": getattr(c, "attempt", 1) or 1,
+            "seq": getattr(c, "seq", 1) or 1,
+            "progress": c.progress,
+            "state_version": getattr(c, "state_version", 1) or 1,
+            "state_hash": getattr(c, "state_hash", ""),
+            "payload": c.payload,
+            "created_at": c.created_at
+        }
+    }
+
+@app.get("/providers/jobs/{job_id}/checkpoints")
+def get_all_job_checkpoints(job_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
+    j=s.get(Job,job_id)
+    if not j: raise HTTPException(404,"Job not found")
+    rows=s.query(Checkpoint).filter_by(job_id=job_id).order_by(Checkpoint.seq.asc()).all()
+    return [{
+        "id": c.id,
+        "job_id": c.job_id,
+        "provider_id": c.provider_id,
+        "attempt": getattr(c, "attempt", 1) or 1,
+        "seq": getattr(c, "seq", 1) or 1,
+        "progress": c.progress,
+        "state_version": getattr(c, "state_version", 1) or 1,
+        "state_hash": getattr(c, "state_hash", ""),
+        "payload": c.payload,
+        "created_at": c.created_at
+    } for c in rows]
+
 @app.get("/checkpoints")
 def checkpoints(u:User=Depends(current_user),s:Session=Depends(db)):
-    rows=s.query(Checkpoint,Job).join(Job, Checkpoint.job_id==Job.id).filter(Job.user_id==u.id).order_by(Checkpoint.created_at.desc()).all()
+    rows=s.query(Checkpoint,Job).join(Job, Checkpoint.job_id==Job.id).filter(Job.user_id==u.id).order_by(Checkpoint.seq.desc(), Checkpoint.created_at.desc()).all()
     # Prefer the provider's system-clock timestamp. The database timestamp remains
     # available in payload for legacy checkpoints that do not include recorded_at.
-    return [{"id":c.id,"job_id":j.id,"job_name":j.name,"provider_id":c.provider_id,"progress":c.progress,"payload":c.payload,"created_at":c.payload.get("state",{}).get("recorded_at",c.created_at) if isinstance(c.payload,dict) else c.created_at} for c,j in rows]
+    return [{"id":c.id,"job_id":j.id,"job_name":j.name,"provider_id":c.provider_id,"attempt":getattr(c,"attempt",1) or 1,"seq":getattr(c,"seq",1) or 1,"progress":c.progress,"state_hash":getattr(c,"state_hash",""),"payload":c.payload,"created_at":c.payload.get("state",{}).get("recorded_at",c.created_at) if isinstance(c.payload,dict) else c.created_at} for c,j in rows]
 @app.get("/dashboard")
 def dashboard(u:User=Depends(current_user),s:Session=Depends(db)):
     js=s.query(Job).filter_by(user_id=u.id).all();ps=s.query(Provider).all();n=max(len(ps),1)

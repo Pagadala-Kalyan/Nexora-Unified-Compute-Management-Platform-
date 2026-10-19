@@ -10,6 +10,8 @@ import tempfile
 import importlib.util
 import uuid
 
+import json
+import hashlib
 from datetime import datetime
 
 import psutil
@@ -508,256 +510,368 @@ def heartbeat():
 
 
 # ============================================================
-# CHECKPOINT
+# FENCING & CHECKPOINT PROTOCOL
 # ============================================================
+
+class FencingError(Exception):
+    """Raised when the control plane rejects an update because a newer provider attempt took over."""
+    pass
+
+
+def canonical_hash(data: dict) -> str:
+    """Computes a deterministic SHA-256 integrity hash for a checkpoint state dictionary."""
+    if not data:
+        return ""
+    serialized = json.dumps(data, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+
+def fetch_valid_checkpoint(job_id):
+    """
+    Fetches the latest valid checkpoint for recovery, verifying integrity hashes
+    and falling back to earlier valid checkpoints if the newest is corrupt.
+    """
+    try:
+        res = request("GET", f"/providers/jobs/{job_id}/checkpoints")
+        if res.status_code != 200:
+            return None
+        cps = res.json()
+        if not cps or not isinstance(cps, list):
+            return None
+
+        # Sort descending by seq, then attempt
+        cps.sort(key=lambda x: (x.get("seq", 0), x.get("attempt", 0)), reverse=True)
+
+        for cp in cps:
+            payload = cp.get("payload") or {}
+            expected_hash = cp.get("state_hash") or ""
+            if expected_hash:
+                actual_hash = canonical_hash(payload)
+                if actual_hash != expected_hash:
+                    print(
+                        f"[RECOVERY WARNING] Checkpoint {cp.get('id')} seq {cp.get('seq')} "
+                        f"corrupted (hash mismatch: expected {expected_hash[:10]}..., got {actual_hash[:10]}...). "
+                        f"Falling back to earlier checkpoint..."
+                    )
+                    continue
+            return cp
+
+        print(f"[RECOVERY WARNING] No valid checkpoints found among {len(cps)} candidates.")
+        return None
+    except Exception as e:
+        print(f"[RECOVERY ERROR] Failed to fetch checkpoints for {job_id}: {e}")
+        return None
+
 
 def checkpoint(
     job_id,
     progress,
     started_at,
-    workload
+    workload,
+    state_payload,
+    attempt=1,
+    seq=1
 ):
+    computed_hash = canonical_hash(state_payload)
 
-    request(
+    # 1. Update job progress with fencing check
+    u_res = request(
         "POST",
         f"/providers/jobs/{job_id}/update",
         json={
-            "progress": progress
+            "progress": progress,
+            "attempt": attempt
         }
     )
+    if u_res.status_code == 409:
+        raise FencingError(
+            f"Stale provider execution fenced out for job {job_id} (attempt {attempt})"
+        )
 
-    request(
+    # 2. Persist genuine state checkpoint with sequence and integrity hash
+    c_res = request(
         "POST",
         f"/providers/jobs/{job_id}/checkpoint",
         json={
             "progress": progress,
-
-            "state": {
-
-                "iteration": progress,
-
-                "workload": workload,
-
-                "provider": PID,
-
-                "elapsed_seconds":
-                    round(
-                        time.perf_counter()
-                        - started_at,
-                        4
-                    ),
-
-                "recorded_at":
-                    datetime.now()
-                    .astimezone()
-                    .isoformat()
-            }
+            "attempt": attempt,
+            "seq": seq,
+            "state_version": 1,
+            "state_hash": computed_hash,
+            "state": state_payload
         }
     )
+    if c_res.status_code == 409:
+        raise FencingError(
+            f"Stale provider checkpoint fenced out for job {job_id} (attempt {attempt})"
+        )
+
+    return c_res
 
 
 # ============================================================
-# MATRIX MULTIPLICATION
+# MATRIX MULTIPLICATION (Cooperative Tiling)
 # ============================================================
 
-def run_matrix_multiply(size, report):
-
-    if not importlib.util.find_spec("torch"):
-
-        raise RuntimeError(
-            "Matrix computation requires PyTorch."
-        )
-
-    import torch
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    left = (
-        torch.arange(
-            size * size,
-            dtype=torch.float32,
-            device=device
-        )
-        .reshape(size, size)
-        .remainder(101)
-    )
-
-    right = (
-        torch.arange(
-            size * size,
-            dtype=torch.float32,
-            device=device
-        )
-        .reshape(size, size)
-        .remainder(89)
-    )
-
+def run_matrix_multiply(size, report, resume_state=None):
+    has_torch = importlib.util.find_spec("torch") is not None
     checksum = 0.0
+    tile_checksums = []
+    start_part = 0
 
-    for part in range(4):
+    if resume_state:
+        saved_size = resume_state.get("matrix_size")
+        if saved_size == size:
+            start_part = int(resume_state.get("completed_tiles", 0))
+            checksum = float(resume_state.get("accumulated_checksum", 0.0))
+            tile_checksums = list(resume_state.get("tile_checksums", []))
+            print(
+                f"[MATRIX MULTIPLY] Resuming from tile {start_part}/4 with checksum {checksum:.3f}."
+            )
+        else:
+            print(
+                f"[MATRIX MULTIPLY WARNING] Matrix size mismatch ({saved_size} != {size}). Starting fresh."
+            )
 
-        row_start = (
-            part * size
-        ) // 4
+    if has_torch:
+        import torch
 
-        row_end = (
-            (part + 1) * size
-        ) // 4
-
-        product = torch.matmul(
-            left[row_start:row_end],
-            right
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
         )
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        checksum += float(
-            product.sum().item()
+        left = (
+            torch.arange(
+                size * size,
+                dtype=torch.float32,
+                device=device
+            )
+            .reshape(size, size)
+            .remainder(101)
         )
 
-        report(
-            (part + 1) * 25
+        right = (
+            torch.arange(
+                size * size,
+                dtype=torch.float32,
+                device=device
+            )
+            .reshape(size, size)
+            .remainder(89)
         )
+
+        for part in range(start_part, 4):
+            row_start = (part * size) // 4
+            row_end = ((part + 1) * size) // 4
+
+            product = torch.matmul(
+                left[row_start:row_end],
+                right
+            )
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+            part_sum = float(product.sum().item())
+            checksum += part_sum
+            tile_checksums.append(round(part_sum, 3))
+
+            completed_tiles = part + 1
+            state_payload = {
+                "workload": "matrix_multiply",
+                "matrix_size": size,
+                "completed_tiles": completed_tiles,
+                "next_tile": completed_tiles,
+                "tile_checksums": list(tile_checksums),
+                "accumulated_checksum": round(checksum, 3)
+            }
+
+            report((part + 1) * 25, state_payload)
+
+        device_name = str(device)
+    else:
+        # Fallback to NumPy for non-PyTorch test environments
+        import numpy as np
+
+        left = (
+            np.arange(
+                size * size,
+                dtype=np.float32
+            )
+            .reshape(size, size)
+            % 101
+        )
+
+        right = (
+            np.arange(
+                size * size,
+                dtype=np.float32
+            )
+            .reshape(size, size)
+            % 89
+        )
+
+        for part in range(start_part, 4):
+            row_start = (part * size) // 4
+            row_end = ((part + 1) * size) // 4
+
+            product = np.matmul(
+                left[row_start:row_end],
+                right
+            )
+
+            part_sum = float(product.sum())
+            checksum += part_sum
+            tile_checksums.append(round(part_sum, 3))
+
+            completed_tiles = part + 1
+            state_payload = {
+                "workload": "matrix_multiply",
+                "matrix_size": size,
+                "completed_tiles": completed_tiles,
+                "next_tile": completed_tiles,
+                "tile_checksums": list(tile_checksums),
+                "accumulated_checksum": round(checksum, 3)
+            }
+
+            report((part + 1) * 25, state_payload)
+
+        device_name = "numpy-cpu"
 
     return {
-
-        "operation":
-            "matrix multiplication",
-
-        "matrix_shape":
-            [size, size],
-
-        "device":
-            str(device),
-
-        "checksum":
-            round(checksum, 3)
+        "operation": "matrix multiplication",
+        "matrix_shape": [size, size],
+        "device": device_name,
+        "checksum": round(checksum, 3)
     }
 
 
 # ============================================================
-# PRIME SEARCH
+# PRIME SEARCH (Partitioned Intervals)
 # ============================================================
 
 def is_prime(number):
-
     if number < 2:
         return False
-
     if number == 2:
         return True
-
     if number % 2 == 0:
         return False
-
     divisor = 3
-
     while divisor * divisor <= number:
-
         if number % divisor == 0:
             return False
-
         divisor += 2
-
     return True
 
 
-def run_prime_search(limit, report):
-
+def run_prime_search(limit, report, resume_state=None):
     primes = []
+    start_part = 0
 
-    for part in range(4):
+    if resume_state:
+        saved_limit = resume_state.get("limit")
+        if saved_limit == limit:
+            primes = list(resume_state.get("accumulated_primes", []))
+            start_part = int(resume_state.get("completed_slices", 0))
+            print(
+                f"[PRIME SEARCH] Resuming from slice {start_part}/4 with {len(primes)} primes loaded."
+            )
+        else:
+            print(
+                f"[PRIME SEARCH WARNING] Limit mismatch ({saved_limit} != {limit}). Starting fresh."
+            )
 
+    for part in range(start_part, 4):
         start = max(
             2,
             (part * limit) // 4 + 1
         )
-
         end = (
             (part + 1) * limit
         ) // 4
 
-        primes.extend(
-            number
-            for number in range(
-                start,
-                end + 1
-            )
-            if is_prime(number)
-        )
+        for number in range(start, end + 1):
+            if is_prime(number):
+                primes.append(number)
 
-        report(
-            (part + 1) * 25
-        )
+        completed_slices = part + 1
+        state_payload = {
+            "workload": "prime_search",
+            "limit": limit,
+            "completed_slices": completed_slices,
+            "next_slice": completed_slices,
+            "accumulated_primes": list(primes),
+            "last_prime": primes[-1] if primes else None
+        }
+
+        report((part + 1) * 25, state_payload)
 
     return {
-
-        "operation":
-            "prime number search",
-
-        "upper_limit":
-            limit,
-
-        "prime_count":
-            len(primes),
-
-        "last_prime":
-            primes[-1]
-            if primes
-            else None,
-
-        "primes":
-            primes
+        "operation": "prime number search",
+        "upper_limit": limit,
+        "prime_count": len(primes),
+        "last_prime": primes[-1] if primes else None,
+        "primes": primes
     }
 
 
 # ============================================================
-# FIBONACCI
+# FIBONACCI (Exact State Serialization)
 # ============================================================
 
-def run_fibonacci(index, report):
-
+def run_fibonacci(index, report, resume_state=None):
     previous = 0
     current = 1
     completed = 0
+    start_part = 0
 
-    for part in range(4):
+    if resume_state:
+        saved_index = resume_state.get("index")
+        if saved_index == index:
+            previous = int(resume_state.get("prev_str", "0"))
+            current = int(resume_state.get("curr_str", "1"))
+            completed = int(resume_state.get("completed_index", 0))
+            start_part = int(resume_state.get("completed_slices", 0))
+            print(
+                f"[FIBONACCI] Resuming from index {completed}/{index} (part {start_part}/4)."
+            )
+        else:
+            print(
+                f"[FIBONACCI WARNING] Index mismatch ({saved_index} != {index}). Starting fresh."
+            )
 
+    for part in range(start_part, 4):
         target = (
             (part + 1) * index
         ) // 4
 
         while completed < target:
-
             previous, current = (
                 current,
                 previous + current
             )
-
             completed += 1
 
-        report(
-            (part + 1) * 25
-        )
+        completed_slices = part + 1
+        state_payload = {
+            "workload": "fibonacci",
+            "index": index,
+            "completed_index": completed,
+            "completed_slices": completed_slices,
+            "prev_str": str(previous),
+            "curr_str": str(current)
+        }
+
+        report((part + 1) * 25, state_payload)
 
     return {
-
-        "operation":
-            "fibonacci calculation",
-
-        "index":
-            index,
-
-        "value":
-            previous,
-
-        "digits":
-            len(str(previous))
+        "operation": "fibonacci calculation",
+        "index": index,
+        "value": previous,
+        "digits": len(str(previous))
     }
 
 
@@ -766,33 +880,68 @@ def run_fibonacci(index, report):
 # ============================================================
 
 def execute(job):
-
     global active_jobs
 
     jid = job["id"]
+    attempt = job.get("attempt", 1) or 1
+    recovery_count = job.get("recovery_count", 0) or 0
+    is_recovery = (job.get("status") == "RECOVERING") or (recovery_count > 0)
 
     active_jobs += 1
 
     print(
         f"\n[JOB RECEIVED] {jid} | "
         f"type: {job['workload']} | "
-        f"submitted by: "
-        f"{job.get('submitted_by', 'unknown user')}"
+        f"attempt: {attempt} | "
+        f"recovery: {is_recovery} | "
+        f"submitted by: {job.get('submitted_by', 'unknown user')}"
     )
 
     started_at = time.perf_counter()
 
-    request(
+    # Recovery: Load genuine persisted computation state
+    resume_state = None
+    seq = 1
+    if is_recovery:
+        print(f"[JOB RECOVERY] Retrieving latest valid checkpoint for {jid}...")
+        valid_cp = fetch_valid_checkpoint(jid)
+        if valid_cp:
+            resume_state = valid_cp.get("payload")
+            seq = int(valid_cp.get("seq", 0)) + 1
+            print(
+                f"[JOB RECOVERY] Successfully restored checkpoint seq {valid_cp.get('seq')} "
+                f"(hash {valid_cp.get('state_hash', '')[:10]}...)"
+            )
+        else:
+            print(f"[JOB RECOVERY] No valid checkpoint available. Starting fresh execution.")
+
+    # Signal RUNNING to control plane with fencing token
+    initial_progress = 0
+    if resume_state:
+        if "completed_slices" in resume_state:
+            initial_progress = int(resume_state["completed_slices"]) * 25
+        elif "completed_tiles" in resume_state:
+            initial_progress = int(resume_state["completed_tiles"]) * 25
+
+    init_res = request(
         "POST",
         f"/providers/jobs/{jid}/update",
         json={
             "status": "RUNNING",
-            "progress": 0
+            "progress": initial_progress,
+            "attempt": attempt
         }
     )
+    if init_res.status_code == 409:
+        print(
+            f"[FENCING REJECTED] Execution attempt {attempt} for job {jid} rejected by control plane. Aborting."
+        )
+        active_jobs = max(0, active_jobs - 1)
+        return
+
+    seq_tracker = [seq]
 
     try:
-
         workload = job["workload"]
 
         size = min(
@@ -808,35 +957,49 @@ def execute(job):
             1200
         )
 
-        report = lambda progress: checkpoint(
-            jid,
-            progress,
-            started_at,
-            workload
-        )
+        def report(progress, state_payload):
+            checkpoint(
+                jid,
+                progress,
+                started_at,
+                workload,
+                state_payload,
+                attempt=attempt,
+                seq=seq_tracker[0]
+            )
+            seq_tracker[0] += 1
 
         if workload == "matrix_multiply":
-
             total = run_matrix_multiply(
                 size,
-                report
+                report,
+                resume_state=resume_state
             )
 
         elif workload == "prime_search":
-
             total = run_prime_search(
                 size,
-                report
+                report,
+                resume_state=resume_state
             )
 
         elif workload == "fibonacci":
-
             total = run_fibonacci(
                 size,
-                report
+                report,
+                resume_state=resume_state
             )
 
         elif workload == "custom_python":
+            # Stage 6: Documented Custom Python Recovery Strategy
+            # Arbitrary OS subprocess execution state cannot be safely serialized across
+            # machine boundaries without specialized virtualization. Therefore, custom Python
+            # jobs restart cleanly from the beginning if recovered, logging an explicit audit notice.
+            if is_recovery:
+                print(
+                    f"[CUSTOM PYTHON] Arbitrary subprocesses cannot transparently migrate memory state. "
+                    f"Restarting workload cleanly from beginning."
+                )
 
             code = job["requirements"].get(
                 "python_code",
@@ -844,10 +1007,7 @@ def execute(job):
             )
 
             if not code.strip():
-
-                raise ValueError(
-                    "No Python code was supplied"
-                )
+                raise ValueError("No Python code was supplied")
 
             filename = job["requirements"].get(
                 "file_name",
@@ -857,7 +1017,6 @@ def execute(job):
             with tempfile.TemporaryDirectory(
                 prefix="nexora-job-"
             ) as workdir:
-
                 source = os.path.join(
                     workdir,
                     os.path.basename(filename)
@@ -868,7 +1027,6 @@ def execute(job):
                     "w",
                     encoding="utf-8"
                 ) as submitted:
-
                     submitted.write(code)
 
                 process = subprocess.run(
@@ -889,36 +1047,24 @@ def execute(job):
                 )
 
             if process.returncode:
-
                 raise RuntimeError(
                     process.stderr[-1500:]
                     or "Python workload failed"
                 )
 
             total = process.stdout[-4000:]
-
-            report(100)
+            report(100, {"workload": "custom_python", "status": "completed"})
 
         else:
-
             raise ValueError(
                 f"Unsupported workload type: {workload}"
             )
 
         message = {
-
-            "matrix_multiply":
-                "Matrix computation completed",
-
-            "prime_search":
-                "Prime search completed",
-
-            "fibonacci":
-                "Fibonacci computation completed",
-
-            "custom_python":
-                "Uploaded Python code completed"
-
+            "matrix_multiply": "Matrix computation completed",
+            "prime_search": "Prime search completed",
+            "fibonacci": "Fibonacci computation completed",
+            "custom_python": "Uploaded Python code completed"
         }.get(
             workload,
             "Workload completed"
@@ -930,80 +1076,64 @@ def execute(job):
             4
         )
 
-        request(
+        comp_res = request(
             "POST",
             f"/providers/jobs/{jid}/update",
             json={
-
-                "status":
-                    "COMPLETED",
-
-                "progress":
-                    100,
-
-                "actual_cost":
-                    round(
-                        .15 / 3600 * elapsed,
-                        5
-                    ),
-
+                "status": "COMPLETED",
+                "progress": 100,
+                "attempt": attempt,
+                "actual_cost": round(.15 / 3600 * elapsed, 5),
                 "result": {
-
-                    "message":
-                        message,
-
-                    "workload":
-                        workload,
-
-                    "input_size":
-                        size,
-
-                    "output":
-                        total,
-
-                    "provider":
-                        PID,
-
-                    "elapsed_seconds":
-                        elapsed
+                    "message": message,
+                    "workload": workload,
+                    "input_size": size,
+                    "output": total,
+                    "provider": PID,
+                    "attempt": attempt,
+                    "recovered": is_recovery,
+                    "elapsed_seconds": elapsed
                 }
             }
         )
+        if comp_res.status_code == 409:
+            print(
+                f"[FENCING REJECTED] Job completion update for {jid} (attempt {attempt}) rejected by control plane."
+            )
 
         print(
             f"[JOB COMPLETED] {jid} | "
             f"output:\n{total}\n"
         )
 
-    except Exception as e:
+    except FencingError as fe:
+        print(f"[JOB ABORTED] Fenced out: {fe}\n")
 
+    except Exception as e:
         print(
             f"[JOB FAILED] {jid} | "
             f"error: {e}\n"
         )
 
         try:
-
             request(
                 "POST",
                 f"/providers/jobs/{jid}/update",
                 json={
                     "status": "FAILED",
+                    "attempt": attempt,
                     "result": {
                         "error": str(e)
                     }
                 }
             )
-
         except requests.RequestException as update_error:
-
             print(
                 f"Could not report job failure: "
                 f"{update_error}"
             )
 
     finally:
-
         active_jobs = max(
             0,
             active_jobs - 1
