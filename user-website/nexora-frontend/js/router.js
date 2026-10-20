@@ -13,6 +13,7 @@ import { renderResourcePoolPage, initResourcePoolEvents } from './pages/resource
 import { renderBillingPage, initBillingEvents } from './pages/billing.js';
 import { renderAnalyticsPage, initAnalyticsEvents } from './pages/analytics.js';
 import { renderSettingsPage, initSettingsEvents } from './pages/settings.js';
+import { renderStreamingPage, initStreamingEvents } from './pages/streaming.js';
 import { renderSidebar, initSidebarEvents } from './components/sidebar.js';
 import { renderTopbar, initTopbarEvents } from './components/topbar.js';
 
@@ -21,6 +22,7 @@ const routes = {
   'landing': { render: renderLandingPage, init: initLandingEvents, isLanding: true },
   'overview': { render: renderOverviewPage, init: initOverviewEvents, isLanding: false },
   'jobs': { render: renderJobsPage, init: initJobsEvents, isLanding: false },
+  'streaming': { render: renderStreamingPage, init: initStreamingEvents, isLanding: false },
   'providers': { render: renderProvidersPage, init: initProvidersEvents, isLanding: false },
   'resource-pool': { render: renderResourcePoolPage, init: initResourcePoolEvents, isLanding: false },
   'billing': { render: renderBillingPage, init: initBillingEvents, isLanding: false },

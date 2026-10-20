@@ -140,3 +140,20 @@ export async function uploadArtifact(file) {
     timeout: 120000 // 2 min timeout for video upload
   });
 }
+
+export async function createStreamSession(payload) {
+  return apiRequest('/stream/sessions', {
+    method: 'POST',
+    body: payload
+  });
+}
+
+export async function getActiveStreamSession() {
+  return apiRequest('/stream/sessions/active');
+}
+
+export async function stopStreamSession(sessionId) {
+  return apiRequest(`/stream/sessions/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST'
+  });
+}

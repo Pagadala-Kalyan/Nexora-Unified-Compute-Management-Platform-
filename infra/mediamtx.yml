@@ -1,0 +1,31 @@
+# ============================================================
+# Nexora UCMP — MediaMTX Configuration
+# Real-Time Remote Live-Stream Ingest & Distribution Hub
+# ============================================================
+
+# API Configuration
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# Webhook Authentication
+# MediaMTX calls the Nexora Control Plane to authenticate stream keys
+authMethod: http
+authHTTPAddress: http://127.0.0.1:8000/stream/internal/mediamtx/auth
+
+# Ingest & Distribution Protocols
+rtmp: yes
+rtmpAddress: :1935
+
+rtsp: yes
+rtspAddress: :8554
+
+webrtc: yes
+webrtcAddress: :8889
+
+hls: no
+
+# Stream Paths
+# All streams in live/* are authenticated against Nexora session credentials
+paths:
+  live:
+    all: yes

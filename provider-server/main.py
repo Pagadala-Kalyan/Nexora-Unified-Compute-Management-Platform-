@@ -517,6 +517,7 @@ def register(retry_indefinitely=True):
             **SYSTEM_INFO,
             "ffmpeg_available": bool(_ffmpeg_bin),
             "ffmpeg_version": _ffmpeg_ver,
+            "stream_encode_capable": bool(_ffmpeg_bin),
         }
     }
 
@@ -1214,6 +1215,203 @@ def run_video_compress(job, report_progress):
 
 
 # ============================================================
+# REMOTE STREAM ENCODING WORKLOAD
+# ============================================================
+
+active_stream_session_id = None
+active_stream_stop_event = threading.Event()
+
+def run_stream_encoder(stream_data):
+    """
+    Long-running remote stream encoder subprocess runner.
+    Pulls live source stream from MediaMTX, transcodes with FFmpeg,
+    pushes to destination RTMP(S), and streams live telemetry to control plane.
+    """
+    global active_stream_session_id, active_stream_stop_event
+
+    binary = get_ffmpeg_binary()
+    if not binary:
+        print("[STREAM] FFmpeg binary not found. Cannot start stream encoding.")
+        return
+
+    session_id = stream_data["session_id"]
+    source_url = stream_data["source_url"]
+    dest_url = stream_data["destination_url"].rstrip("/")
+    dest_key = stream_data.get("destination_key", "")
+    full_dest = f"{dest_url}/{dest_key}" if dest_key else dest_url
+
+    cfg = stream_data.get("encoding_config") or {}
+    width = cfg.get("width", 1280)
+    height = cfg.get("height", 720)
+    fps = cfg.get("fps", 60)
+    v_bitrate = cfg.get("video_bitrate_kbps", 4500)
+    a_bitrate = cfg.get("audio_bitrate_kbps", 160)
+    preset = cfg.get("preset", "veryfast")
+
+    active_stream_session_id = session_id
+    active_stream_stop_event.clear()
+
+    print()
+    print("=" * 60)
+    print(f"[STREAM STARTING] Session: {session_id}")
+    print(f"[STREAM PROFILE] {width}x{height} @ {fps}fps | {v_bitrate}k video, {a_bitrate}k audio")
+    print(f"[STREAM SOURCE]  {source_url}")
+    print(f"[STREAM DEST]    {dest_url}/****")
+    print("=" * 60)
+    print()
+
+    # Build safe FFmpeg argument array (strictly no shell interpolation)
+    cmd = [
+        binary,
+        "-y",
+        "-re",
+        "-i", source_url,
+        "-vf", f"scale={width}:{height}",
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-b:v", f"{v_bitrate}k",
+        "-maxrate", f"{v_bitrate + 500}k",
+        "-bufsize", f"{v_bitrate * 2}k",
+        "-pix_fmt", "yuv420p",
+        "-g", str(fps * 2),
+        "-c:a", "aac",
+        "-b:a", f"{a_bitrate}k",
+        "-ar", "48000",
+        "-f", "flv",
+        "-progress", "pipe:1",
+        "-nostats",
+        full_dest
+    ]
+
+    metrics = {
+        "status": "starting",
+        "fps": 0.0,
+        "bitrate_kbps": 0.0,
+        "speed": "0.0x",
+        "dropped_frames": 0,
+        "uptime_seconds": 0
+    }
+    metrics_lock = threading.Lock()
+    start_time = time.time()
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+    except Exception as e:
+        print(f"[STREAM ERROR] Failed to spawn FFmpeg: {e}")
+        try:
+            request("POST", f"/providers/streams/{session_id}/stopped", json={
+                "status": "FAILED",
+                "error": str(e)
+            })
+        except Exception:
+            pass
+        active_stream_session_id = None
+        return
+
+    def stream_telemetry_loop():
+        while not active_stream_stop_event.is_set():
+            time.sleep(5)
+            if active_stream_stop_event.is_set():
+                break
+            uptime = int(time.time() - start_time)
+            with metrics_lock:
+                metrics["uptime_seconds"] = uptime
+                current_metrics = dict(metrics)
+
+            try:
+                resp = request("POST", f"/providers/streams/{session_id}/heartbeat", json={
+                    "status": "ENCODING",
+                    "metrics": current_metrics
+                }, timeout=6)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    action = data.get("action")
+                    if action == "stop":
+                        print(f"[STREAM STOP] Control plane requested stop ({data.get('reason')})")
+                        active_stream_stop_event.set()
+                        if proc and proc.poll() is None:
+                            proc.terminate()
+                        break
+            except Exception as ex:
+                print(f"[STREAM TELEMETRY ERROR] {ex}")
+
+    hb_thread = threading.Thread(target=stream_telemetry_loop, daemon=True)
+    hb_thread.start()
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("fps="):
+                try:
+                    val = float(line.split("=", 1)[1].strip())
+                    with metrics_lock:
+                        metrics["fps"] = round(val, 1)
+                except ValueError:
+                    pass
+            elif line.startswith("bitrate="):
+                try:
+                    val_str = line.split("=", 1)[1].strip().replace("kbits/s", "").strip()
+                    val = float(val_str)
+                    with metrics_lock:
+                        metrics["bitrate_kbps"] = round(val, 1)
+                except ValueError:
+                    pass
+            elif line.startswith("speed="):
+                try:
+                    val_str = line.split("=", 1)[1].strip()
+                    with metrics_lock:
+                        metrics["speed"] = val_str
+                except Exception:
+                    pass
+            elif line.startswith("drop_frames="):
+                try:
+                    val = int(line.split("=", 1)[1].strip())
+                    with metrics_lock:
+                        metrics["dropped_frames"] = val
+                except ValueError:
+                    pass
+
+            if active_stream_stop_event.is_set():
+                break
+
+    except Exception as read_err:
+        print(f"[STREAM READ WARNING] {read_err}")
+    finally:
+        active_stream_stop_event.set()
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        uptime = int(time.time() - start_time)
+        with metrics_lock:
+            metrics["uptime_seconds"] = uptime
+            final_metrics = dict(metrics)
+
+        print(f"[STREAM ENDED] Session {session_id} finished after {uptime}s.")
+        try:
+            request("POST", f"/providers/streams/{session_id}/stopped", json={
+                "status": "COMPLETED",
+                "metrics": final_metrics
+            })
+        except Exception as stop_report_err:
+            print(f"[STREAM REPORT ERROR] Could not notify control plane: {stop_report_err}")
+
+        active_stream_session_id = None
+
+
+# ============================================================
 # JOB EXECUTION
 # ============================================================
 
@@ -1519,6 +1717,27 @@ def listener():
                     args=(job,),
                     daemon=True
                 ).start()
+
+            # Check for assigned remote streaming sessions
+            if active_stream_session_id is None:
+                try:
+                    s_resp = request(
+                        "GET",
+                        f"/providers/{PID}/streams/pending",
+                        timeout=5
+                    )
+                    if s_resp.status_code == 200:
+                        pending_streams = s_resp.json()
+                        for stream_data in pending_streams:
+                            if active_stream_session_id is None:
+                                threading.Thread(
+                                    target=run_stream_encoder,
+                                    args=(stream_data,),
+                                    daemon=True
+                                ).start()
+                                break
+                except Exception:
+                    pass
 
         except requests.RequestException as e:
             if is_connected:

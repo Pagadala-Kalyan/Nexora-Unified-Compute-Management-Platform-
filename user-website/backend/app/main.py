@@ -1,17 +1,22 @@
+import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
+from cryptography.fernet import Fernet
 import jwt
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
@@ -39,6 +44,78 @@ MAX_VIDEO_UPLOAD_BYTES = int(os.getenv("MAX_VIDEO_UPLOAD_BYTES", 50 * 1024 * 102
 MAX_VIDEO_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_DURATION_SECONDS", 300)) # 5 minutes
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 ALLOWED_VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "application/octet-stream"}
+
+# Remote Stream Encoding Profiles & Helpers
+STREAM_PROFILES = {
+    "720p60": {
+        "width": 1280,
+        "height": 720,
+        "fps": 60,
+        "video_bitrate_kbps": 4500,
+        "audio_bitrate_kbps": 160,
+        "preset": "veryfast",
+        "tokens_per_minute": 2,
+    },
+    "1080p60": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "video_bitrate_kbps": 6500,
+        "audio_bitrate_kbps": 160,
+        "preset": "veryfast",
+        "tokens_per_minute": 4,
+    },
+    "720p30": {
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "video_bitrate_kbps": 3000,
+        "audio_bitrate_kbps": 128,
+        "preset": "veryfast",
+        "tokens_per_minute": 1,
+    }
+}
+
+def get_fernet_cipher() -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256(JWT_SECRET.encode("utf-8")).digest())
+    return Fernet(key)
+
+def encrypt_secret(val: str) -> str:
+    return get_fernet_cipher().encrypt(val.encode("utf-8")).decode("utf-8")
+
+def decrypt_secret(val: str) -> str:
+    return get_fernet_cipher().decrypt(val.encode("utf-8")).decode("utf-8")
+
+def validate_destination_target(url: str, key: str) -> tuple[str, str, str]:
+    """Validate RTMP/RTMPS destination URL and stream key, preventing SSRF."""
+    if not url or not isinstance(url, str):
+        raise HTTPException(422, "Destination URL is required")
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme.lower() not in ("rtmp", "rtmps"):
+        raise HTTPException(422, "Destination URL must use rtmp:// or rtmps:// protocol")
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(422, "Invalid destination host")
+
+    low_host = host.lower()
+    if low_host in ("localhost", "127.0.0.1", "::1", "metadata.google.internal") or low_host.endswith(".internal") or low_host.endswith(".local"):
+        raise HTTPException(422, "Destination cannot point to a local or internal host")
+
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "rtmps" else 1935)
+        addrinfo = socket.getaddrinfo(host, port)
+        for res in addrinfo:
+            ip = ipaddress.ip_address(res[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise HTTPException(422, f"Destination resolves to forbidden private or loopback IP: {ip}")
+    except socket.gaierror:
+        raise HTTPException(422, f"Could not resolve destination host: {host}")
+
+    clean_key = (key or "").strip()
+    if not clean_key or len(clean_key) < 3:
+        raise HTTPException(422, "Valid stream key is required")
+    masked_key = clean_key[:3] + "****" + clean_key[-3:] if len(clean_key) > 6 else "****"
+    return url.strip(), clean_key, masked_key
 
 def get_ffmpeg_binary():
     found = shutil.which("ffmpeg")
@@ -169,6 +246,35 @@ class AuditEvent(Base):
     id: Mapped[str]=mapped_column(String, primary_key=True); user_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True, index=True); provider_id: Mapped[Optional[str]]=mapped_column(ForeignKey("providers.id"), nullable=True, index=True); job_id: Mapped[Optional[str]]=mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
     event_type: Mapped[str]=mapped_column(String); details: Mapped[dict]=mapped_column(JSON, default=dict); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+class StreamSession(Base):
+    __tablename__ = "stream_sessions"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    provider_id: Mapped[Optional[str]] = mapped_column(ForeignKey("providers.id"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String, default="CREATED")
+
+    ingest_path: Mapped[str] = mapped_column(String)
+    publish_key: Mapped[str] = mapped_column(String)
+    read_key: Mapped[str] = mapped_column(String)
+
+    destination_platform: Mapped[str] = mapped_column(String, default="custom_rtmp")
+    destination_url: Mapped[str] = mapped_column(String)
+    destination_key_masked: Mapped[str] = mapped_column(String)
+    destination_key_encrypted: Mapped[str] = mapped_column(Text)
+
+    profile_name: Mapped[str] = mapped_column(String, default="720p60")
+    encoding_config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    latest_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    tokens_per_minute: Mapped[int] = mapped_column(Integer, default=2)
+    total_tokens_billed: Mapped[int] = mapped_column(Integer, default=0)
+    last_billed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
 class Register(BaseModel): email: str; password: str = Field(min_length=8)
 class Login(Register): pass
 class JobCreate(BaseModel): name: str = Field(min_length=2, max_length=100); workload: str = "matrix_multiply"; requirements: dict = Field(default_factory=dict)
@@ -177,6 +283,26 @@ class Heartbeat(BaseModel): status: str="ONLINE"; utilization: dict=Field(defaul
 class Update(BaseModel): status: Optional[JobStatus]=None; progress: Optional[int]=Field(None, ge=0, le=100); result: Optional[dict]=None; actual_cost: Optional[float]=None; attempt: Optional[int]=None
 class DemoTopUp(BaseModel): amount: float = Field(gt=0, le=10000); card_number: str = Field(min_length=12, max_length=23); cardholder: str = Field(min_length=2, max_length=80); expiry: str = Field(min_length=4, max_length=7); cvc: str = Field(min_length=3, max_length=4)
 class TokenPurchase(BaseModel): package_id: str
+class StreamSessionCreate(BaseModel):
+    destination_platform: str = "custom_rtmp"
+    destination_url: str
+    destination_key: str
+    profile: str = "720p60"
+
+class MediaMTXAuthPayload(BaseModel):
+    ip: Optional[str] = None
+    user: Optional[str] = None
+    password: Optional[str] = None
+    path: Optional[str] = None
+    protocol: Optional[str] = None
+    id: Optional[str] = None
+    action: Optional[str] = "publish"
+    query: Optional[str] = None
+
+class StreamHeartbeatPayload(BaseModel):
+    status: str = "ENCODING"
+    metrics: dict = Field(default_factory=dict)
+    error: Optional[str] = None
 
 app=FastAPI(title="Nexora UCMP Control Plane", version="0.1.0")
 # Allow any local development port (Vite/Next commonly choose a different port
@@ -252,8 +378,35 @@ def job_data(j, s=None):
 def provider_data(p): return {"id":p.id,"name":p.name,"cpu_cores":p.cpu_cores,"ram_gb":p.ram_gb,"gpu_name":p.gpu_name,"gpu_memory_gb":p.gpu_memory_gb,"cost_per_hour":p.cost_per_hour,"status":p.status,"reliability":p.reliability,"utilization":p.utilization,"system_info":p.system_info or {},"last_heartbeat":p.last_heartbeat}
 def compatible_provider(s, requirements, exclude_id=None):
     workload = requirements.get("workload")
-    candidates=[p for p in s.query(Provider).all() if p.id!=exclude_id and p.status in ("ONLINE","AVAILABLE") and p.cpu_cores>=requirements.get("cpu_cores",1) and p.ram_gb>=requirements.get("ram_gb",1) and (not requirements.get("gpu_required") or p.gpu_name) and (workload != "video_compress" or (p.system_info or {}).get("ffmpeg_available"))]
-    return min(candidates,key=lambda x:x.cost_per_hour/(max(x.reliability,1)/100)) if candidates else None
+    min_cores = requirements.get("cpu_cores", 4 if workload == "remote_stream_encode" else 1)
+    min_ram = requirements.get("ram_gb", 4 if workload == "remote_stream_encode" else 1)
+
+    busy_stream_providers = set()
+    if workload == "remote_stream_encode":
+        try:
+            busy_stream_providers = {
+                row[0] for row in s.query(StreamSession.provider_id)
+                .filter(StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING"]))
+                .all() if row[0]
+            }
+        except Exception:
+            pass
+
+    candidates = []
+    for p in s.query(Provider).all():
+        if p.id == exclude_id or p.status not in ("ONLINE", "AVAILABLE"):
+            continue
+        if p.cpu_cores < min_cores or p.ram_gb < min_ram:
+            continue
+        if requirements.get("gpu_required") and not p.gpu_name:
+            continue
+        if workload in ("video_compress", "remote_stream_encode") and not (p.system_info or {}).get("ffmpeg_available"):
+            continue
+        if workload == "remote_stream_encode" and p.id in busy_stream_providers:
+            continue
+        candidates.append(p)
+
+    return min(candidates, key=lambda x: x.cost_per_hour / (max(x.reliability, 1) / 100)) if candidates else None
 def recover_lost_providers():
     """Detect provider loss and re-dispatch checkpointed controlled workloads with generation fencing."""
     while True:
@@ -265,6 +418,15 @@ def recover_lost_providers():
                 last=failed.last_heartbeat if failed.last_heartbeat.tzinfo else failed.last_heartbeat.replace(tzinfo=timezone.utc)
                 if (now-last).total_seconds() <= int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS","20")): continue
                 failed.status="OFFLINE"
+                # Handle lost stream sessions on this provider
+                try:
+                    for stream in s.query(StreamSession).filter(StreamSession.provider_id==failed.id, StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])).all():
+                        stream.status = "FAILED"
+                        stream.error_message = f"Provider {failed.name} disconnected unexpectedly."
+                        stream.completed_at = now
+                        add_audit(s, "stream.provider_lost", user_id=stream.user_id, provider_id=failed.id, details={"session_id": stream.id})
+                except Exception as sex:
+                    print(f"[RECOVERY MONITOR STREAM ERROR] {sex}")
                 for j in s.query(Job).filter(Job.provider_id==failed.id,Job.status.in_(["SCHEDULED","RUNNING"])).all():
                     checkpoint=s.query(Checkpoint).filter_by(job_id=j.id).order_by(Checkpoint.seq.desc(), Checkpoint.created_at.desc()).first()
                     replacement=compatible_provider(s,j.requirements,failed.id)
@@ -304,8 +466,20 @@ def ensure_schema_columns(s):
                 ("jobs", [("attempt", "INTEGER DEFAULT 1"), ("recovery_count", "INTEGER DEFAULT 0")]),
                 ("checkpoints", [("seq", "INTEGER DEFAULT 1"), ("attempt", "INTEGER DEFAULT 1"), ("state_version", "INTEGER DEFAULT 1"), ("state_hash", "TEXT DEFAULT ''")]),
                 ("job_artifacts", [("artifact_type", "TEXT DEFAULT 'input'"), ("file_path", "TEXT"), ("checksum_sha256", "TEXT"), ("meta_data", "TEXT DEFAULT '{}'")]),
-                ("providers", [("system_info", "TEXT DEFAULT '{}'")])
+                ("providers", [("system_info", "TEXT DEFAULT '{}'")]),
+                ("stream_sessions", [
+                    ("error_message", "TEXT"),
+                    ("latest_metrics", "TEXT DEFAULT '{}'"),
+                    ("tokens_per_minute", "INTEGER DEFAULT 2"),
+                    ("total_tokens_billed", "INTEGER DEFAULT 0"),
+                    ("last_billed_at", "DATETIME"),
+                    ("started_at", "DATETIME"),
+                    ("completed_at", "DATETIME")
+                ])
             ]:
+                tbl_exists = s.execute(text(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")).fetchone()
+                if not tbl_exists:
+                    continue
                 existing = [r[1] for r in s.execute(text(f"PRAGMA table_info({table})")).fetchall()]
                 for col_name, col_def in cols:
                     if col_name not in existing:
@@ -787,4 +961,264 @@ async def provider_upload_artifact(job_id: str, file: UploadFile = File(...), ar
         "valid": probe.get("valid"),
         "meta": probe
     }
+
+
+# ============================================================
+# REMOTE STREAM ENCODING ENDPOINTS
+# ============================================================
+
+MEDIAMTX_INGEST_URL = os.getenv("MEDIAMTX_INGEST_URL", "rtmp://127.0.0.1:1935")
+MEDIAMTX_INTERNAL_URL = os.getenv("MEDIAMTX_INTERNAL_URL", "rtsp://127.0.0.1:8554")
+
+def stream_session_data(session: StreamSession, include_keys: bool = False, provider_name: Optional[str] = None):
+    data = {
+        "id": session.id,
+        "user_id": session.user_id,
+        "provider_id": session.provider_id,
+        "provider_name": provider_name,
+        "status": session.status,
+        "destination_platform": session.destination_platform,
+        "destination_url": session.destination_url,
+        "destination_key_masked": session.destination_key_masked,
+        "profile_name": session.profile_name,
+        "encoding_config": session.encoding_config or {},
+        "latest_metrics": session.latest_metrics or {},
+        "error_message": session.error_message,
+        "tokens_per_minute": session.tokens_per_minute,
+        "total_tokens_billed": session.total_tokens_billed,
+        "created_at": session.created_at,
+        "started_at": session.started_at,
+        "completed_at": session.completed_at,
+        "ingest_server": f"{MEDIAMTX_INGEST_URL}/live",
+    }
+    if include_keys:
+        data["stream_key"] = f"{session.id}?key={session.publish_key}"
+        data["publish_key"] = session.publish_key
+    return data
+
+@app.post("/stream/sessions")
+def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_user), s: Session = Depends(db)):
+    active = s.query(StreamSession).filter(
+        StreamSession.user_id == u.id,
+        StreamSession.status.in_(["CREATED", "ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])
+    ).first()
+    if active:
+        raise HTTPException(409, f"You already have an active stream session ({active.id}). Stop it before starting a new one.")
+
+    wallet = wallet_for(s, u.id)
+    if wallet.token_balance < 10:
+        raise HTTPException(402, detail={
+            "message": "Insufficient token balance to start a stream session",
+            "required": 10,
+            "available": wallet.token_balance
+        })
+
+    profile_key = body.profile if body.profile in STREAM_PROFILES else "720p60"
+    profile_cfg = STREAM_PROFILES[profile_key]
+
+    dest_url, dest_key, masked_key = validate_destination_target(body.destination_url, body.destination_key)
+
+    reqs = {
+        "workload": "remote_stream_encode",
+        "cpu_cores": 4 if profile_key in ("1080p60", "720p60") else 2,
+        "ram_gb": 4
+    }
+    p = compatible_provider(s, reqs)
+    if not p:
+        raise HTTPException(409, "No compatible online provider with FFmpeg is currently available for stream encoding.")
+
+    session_id = f"stream_{secrets.token_hex(6)}"
+    publish_key = f"nxt_live_{secrets.token_hex(12)}"
+    read_key = f"nxt_read_{secrets.token_hex(12)}"
+    enc_dest_key = encrypt_secret(dest_key)
+
+    p.status = "BUSY"
+
+    session = StreamSession(
+        id=session_id,
+        user_id=u.id,
+        provider_id=p.id,
+        status="ALLOCATED",
+        ingest_path=f"live/{session_id}",
+        publish_key=publish_key,
+        read_key=read_key,
+        destination_platform=body.destination_platform,
+        destination_url=dest_url,
+        destination_key_masked=masked_key,
+        destination_key_encrypted=enc_dest_key,
+        profile_name=profile_key,
+        encoding_config=profile_cfg,
+        tokens_per_minute=profile_cfg.get("tokens_per_minute", 2),
+        total_tokens_billed=0,
+        latest_metrics={"status": "waiting_for_obs", "fps": 0, "bitrate_kbps": 0}
+    )
+    s.add(session)
+    add_audit(s, "stream.created", user_id=u.id, provider_id=p.id, details={"session_id": session_id, "profile": profile_key})
+    s.commit()
+    s.refresh(session)
+    return stream_session_data(session, include_keys=True, provider_name=p.name)
+
+@app.get("/stream/sessions/active")
+def get_active_stream_session(u: User = Depends(current_user), s: Session = Depends(db)):
+    session = s.query(StreamSession).filter(
+        StreamSession.user_id == u.id,
+        StreamSession.status.in_(["CREATED", "ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])
+    ).order_by(StreamSession.created_at.desc()).first()
+    if not session:
+        return {"active": False, "session": None}
+    p = s.get(Provider, session.provider_id) if session.provider_id else None
+    return {"active": True, "session": stream_session_data(session, include_keys=True, provider_name=p.name if p else None)}
+
+@app.get("/stream/sessions/{session_id}")
+def get_stream_session(session_id: str, u: User = Depends(current_user), s: Session = Depends(db)):
+    session = s.get(StreamSession, session_id)
+    if not session or session.user_id != u.id:
+        raise HTTPException(404, "Stream session not found")
+    p = s.get(Provider, session.provider_id) if session.provider_id else None
+    return stream_session_data(session, include_keys=False, provider_name=p.name if p else None)
+
+@app.post("/stream/sessions/{session_id}/stop")
+def stop_stream_session(session_id: str, u: User = Depends(current_user), s: Session = Depends(db)):
+    session = s.get(StreamSession, session_id)
+    if not session or session.user_id != u.id:
+        raise HTTPException(404, "Stream session not found")
+    if session.status in ("COMPLETED", "FAILED"):
+        return stream_session_data(session)
+
+    session.status = "STOPPING"
+    add_audit(s, "stream.stop_requested", user_id=u.id, provider_id=session.provider_id, details={"session_id": session_id})
+    s.commit()
+    return stream_session_data(session)
+
+@app.post("/stream/internal/mediamtx/auth")
+def mediamtx_auth(body: MediaMTXAuthPayload, s: Session = Depends(db)):
+    """Webhook invoked by MediaMTX to authenticate publish and read connections."""
+    path = (body.path or "").strip("/ ")
+    session_id = path.split("/")[-1] if "/" in path else path
+
+    key = body.password
+    if not key and body.query:
+        qs = urllib.parse.parse_qs(body.query)
+        if "key" in qs:
+            key = qs["key"][0]
+
+    session = s.get(StreamSession, session_id)
+    if not session or session.status in ("COMPLETED", "FAILED"):
+        raise HTTPException(401, "Invalid session or session not active")
+
+    if body.action == "publish":
+        if not key or not secrets.compare_digest(key, session.publish_key):
+            raise HTTPException(401, "Invalid publish stream key")
+        if session.status == "ALLOCATED":
+            session.status = "INGESTING"
+            s.commit()
+        return {"status": "ok", "action": "publish"}
+
+    elif body.action == "read":
+        if not key or not secrets.compare_digest(key, session.read_key):
+            raise HTTPException(401, "Invalid read key")
+        return {"status": "ok", "action": "read"}
+
+    raise HTTPException(400, "Unknown auth action")
+
+@app.get("/providers/{provider_id}/streams/pending")
+def provider_pending_streams(provider_id: str, _ = Depends(provider_auth), s: Session = Depends(db)):
+    sessions = s.query(StreamSession).filter(
+        StreamSession.provider_id == provider_id,
+        StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING"])
+    ).all()
+    results = []
+    for sess in sessions:
+        try:
+            plain_dest_key = decrypt_secret(sess.destination_key_encrypted)
+        except Exception:
+            plain_dest_key = ""
+        results.append({
+            "session_id": sess.id,
+            "status": sess.status,
+            "source_url": f"{MEDIAMTX_INTERNAL_URL}/live/{sess.id}?key={sess.read_key}",
+            "destination_url": sess.destination_url,
+            "destination_key": plain_dest_key,
+            "profile_name": sess.profile_name,
+            "encoding_config": sess.encoding_config or {},
+            "tokens_per_minute": sess.tokens_per_minute
+        })
+    return results
+
+@app.post("/providers/streams/{session_id}/heartbeat")
+def provider_stream_heartbeat(session_id: str, body: StreamHeartbeatPayload, _ = Depends(provider_auth), s: Session = Depends(db)):
+    sess = s.get(StreamSession, session_id)
+    if not sess:
+        raise HTTPException(404, "Stream session not found")
+
+    now = datetime.now(timezone.utc)
+    if sess.status == "STOPPING":
+        return {"action": "stop", "reason": "user_cancelled"}
+
+    if sess.status in ("COMPLETED", "FAILED"):
+        return {"action": "stop", "reason": "session_terminated"}
+
+    if sess.status in ("ALLOCATED", "INGESTING"):
+        sess.status = "ENCODING"
+    if not sess.started_at:
+        sess.started_at = now
+        sess.last_billed_at = now
+
+    sess.latest_metrics = body.metrics or {}
+
+    wallet = wallet_for(s, sess.user_id)
+    last_bill = sess.last_billed_at if (sess.last_billed_at and sess.last_billed_at.tzinfo) else (sess.last_billed_at.replace(tzinfo=timezone.utc) if sess.last_billed_at else now)
+    elapsed_since_bill = (now - last_bill).total_seconds()
+
+    if elapsed_since_bill >= 60:
+        minutes_to_bill = int(elapsed_since_bill // 60)
+        tokens_due = minutes_to_bill * sess.tokens_per_minute
+
+        if wallet.token_balance < tokens_due:
+            drained = max(0, wallet.token_balance)
+            if drained:
+                token_ledger(s, wallet, "STREAM_USAGE", -drained, "STREAM", sess.id, f"Final stream usage for {sess.id}", sess.id)
+                sess.total_tokens_billed += drained
+            sess.status = "STOPPING"
+            sess.error_message = "Budget exhausted: insufficient tokens"
+            s.commit()
+            return {"action": "stop", "reason": "insufficient_tokens"}
+        else:
+            token_ledger(s, wallet, "STREAM_USAGE", -tokens_due, "STREAM", sess.id, f"Stream compute minute for {sess.id}", sess.id)
+            sess.total_tokens_billed += tokens_due
+            sess.last_billed_at = now
+            s.commit()
+
+    s.commit()
+    return {"action": "continue", "token_balance": wallet.token_balance}
+
+@app.post("/providers/streams/{session_id}/stopped")
+def provider_stream_stopped(session_id: str, body: StreamHeartbeatPayload, _ = Depends(provider_auth), s: Session = Depends(db)):
+    sess = s.get(StreamSession, session_id)
+    if not sess:
+        raise HTTPException(404, "Stream session not found")
+
+    now = datetime.now(timezone.utc)
+    sess.completed_at = now
+    if body.error:
+        sess.status = "FAILED"
+        sess.error_message = body.error
+    else:
+        sess.status = "COMPLETED"
+
+    if body.metrics:
+        sess.latest_metrics = body.metrics
+
+    p = s.get(Provider, sess.provider_id)
+    if p:
+        p.status = "ONLINE"
+
+    add_audit(s, "stream.completed", user_id=sess.user_id, provider_id=sess.provider_id, details={
+        "session_id": session_id,
+        "status": sess.status,
+        "total_tokens_billed": sess.total_tokens_billed,
+        "error": sess.error_message
+    })
+    s.commit()
+    return {"ok": True, "status": sess.status}
 

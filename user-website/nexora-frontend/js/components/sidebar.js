@@ -19,6 +19,7 @@ export function renderSidebar(currentRoute = 'overview') {
   const computeNav = [
     { id: 'overview', label: 'Dashboard', icon: 'layers', badge: null },
     { id: 'jobs', label: 'Compute Jobs', icon: 'terminal', badge: activeJobsCount > 0 ? activeJobsCount : null },
+    { id: 'streaming', label: 'Live Stream Studio', icon: 'radio', badge: null },
     { id: 'providers', label: 'Fleet Providers', icon: 'server', badge: onlineProvidersCount > 0 ? onlineProvidersCount : null },
     { id: 'resource-pool', label: 'Resource Pool', icon: 'cpu', badge: null },
   ];

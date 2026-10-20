@@ -62,7 +62,9 @@ export const icons = {
 
   externalLink: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`,
 
-  brandMark: `<svg width="24" height="24" viewBox="0 0 32 32" fill="none"><path d="M16 2L28.1244 8.99999V23L16 30L3.87564 23V8.99999L16 2Z" stroke="url(#brandGrad)" stroke-width="2.5"/><circle cx="16" cy="16" r="4.5" fill="url(#brandGrad)"/><line x1="16" y1="6" x2="16" y2="11.5" stroke="currentColor" stroke-width="1.8"/><line x1="24" y1="21" x2="19.5" y2="18.5" stroke="currentColor" stroke-width="1.8"/><line x1="8" y1="21" x2="12.5" y2="18.5" stroke="currentColor" stroke-width="1.8"/><defs><linearGradient id="brandGrad" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse"><stop stop-color="#00E5FF"/><stop offset="1" stop-color="#8B5CF6"/></linearGradient></defs></svg>`
+  brandMark: `<svg width="24" height="24" viewBox="0 0 32 32" fill="none"><path d="M16 2L28.1244 8.99999V23L16 30L3.87564 23V8.99999L16 2Z" stroke="url(#brandGrad)" stroke-width="2.5"/><circle cx="16" cy="16" r="4.5" fill="url(#brandGrad)"/><line x1="16" y1="6" x2="16" y2="11.5" stroke="currentColor" stroke-width="1.8"/><line x1="24" y1="21" x2="19.5" y2="18.5" stroke="currentColor" stroke-width="1.8"/><line x1="8" y1="21" x2="12.5" y2="18.5" stroke="currentColor" stroke-width="1.8"/><defs><linearGradient id="brandGrad" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse"><stop stop-color="#00E5FF"/><stop offset="1" stop-color="#8B5CF6"/></linearGradient></defs></svg>`,
+
+  radio: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg>`
 };
 
 export function getIcon(name) {
