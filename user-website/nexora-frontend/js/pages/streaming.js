@@ -33,7 +33,7 @@ const PLATFORM_PRESETS = {
   }
 };
 
-export async function renderStreamingPage() {
+export function renderStreamingPage() {
   let initialHtml = `
     <div class="page-container stream-studio-page">
       <!-- Page Header -->
