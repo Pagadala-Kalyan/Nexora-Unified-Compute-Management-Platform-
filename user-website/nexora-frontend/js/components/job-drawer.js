@@ -131,7 +131,7 @@ export function openJobDrawer(jobId) {
 
         ${job.result?.video ? `
         <!-- Video Compression Output Card -->
-        <div style="background: linear-gradient(135deg, rgba(0, 229, 255, 0.08), rgba(139, 92, 246, 0.08)); border: 1px solid var(--accent-cyan); border-radius: var(--radius-md); padding: var(--space-4);">
+        <div style="background: linear-gradient(135deg, var(--accent-cyan-soft), var(--accent-violet-soft)); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: var(--space-4);">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-3);">
             <div>
               <div style="font-size: var(--text-xs); font-weight: 700; color: var(--accent-cyan); text-transform: uppercase; letter-spacing: 0.5px;">

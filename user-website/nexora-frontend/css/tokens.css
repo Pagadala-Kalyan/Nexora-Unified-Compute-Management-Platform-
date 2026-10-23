@@ -5,42 +5,47 @@
 
 :root {
   /* Surfaces & Backgrounds */
-  --bg-main: #080B12;
-  --bg-sidebar: #0C0F17;
-  --bg-secondary: #151B29;
-  --panel-primary: #111622;
-  --panel-secondary: #151B29;
-  --surface-hover: #1B2333;
-  --surface-card: #111622;
-  --surface-overlay: rgba(8, 11, 18, 0.88);
+  --bg-main: #090810;
+  --bg-sidebar: #0D0B16;
+  --bg-secondary: #12101C;
+  --panel-primary: #191626;
+  --panel-secondary: #221D32;
+  --surface-hover: #2B2440;
+  --surface-active: #34284D;
+  --surface-card: #191626;
+  --surface-overlay: rgba(9, 8, 16, 0.90);
 
   /* Typography Colors */
-  --text-primary: #F3F6FC;
-  --text-secondary: #9AA6B8;
-  --text-muted: #687589;
-  --text-inverse: #080B12;
+  --text-primary: #F5F3FF;
+  --text-secondary: #C0B9D2;
+  --text-muted: #9189A6;
+  --text-inverse: #090810;
 
   /* Thin Borders & Hairlines */
-  --border-color: #242D3D;
-  --border-subtle: #18202D;
-  --border-focus: #13D9F2;
-  --border-glow: 0 0 16px rgba(19, 217, 242, 0.25);
+  --border-color: #302A40;
+  --border-subtle: #302A40;
+  --border-focus: #49405F;
+  --border-glow: 0 0 0 3px rgba(139, 100, 255, 0.28);
 
-  /* Primary Cyan Accents */
-  --accent-cyan: #13D9F2;
-  --accent-cyan-hover: #5BE8F7;
-  --accent-cyan-soft: rgba(19, 217, 242, 0.08);
-  --accent-cyan-glow: rgba(19, 217, 242, 0.18);
+  /* Primary royal-purple accents */
+  --accent-cyan: #8B64FF;
+  --accent-cyan-hover: #A78BFA;
+  --accent-cyan-soft: rgba(139, 100, 255, 0.14);
+  --accent-cyan-glow: rgba(139, 100, 255, 0.16);
 
-  /* Secondary Violet Accents */
-  --accent-violet: #7566F6;
-  --accent-violet-vivid: #8B5CF6;
-  --accent-violet-endpoint: #A855F7;
-  --accent-violet-soft: rgba(117, 102, 246, 0.08);
-  --accent-violet-glow: rgba(168, 85, 247, 0.20);
-  --accent-cyan-bright: #5BE8F7;
-  --surface-primary: #111622;
-  --surface-elevated: #151B29;
+  /* Secondary indigo accents */
+  --accent-violet: #6652D9;
+  --accent-violet-vivid: #A78BFA;
+  --accent-violet-endpoint: #C4B5FD;
+  --accent-violet-soft: rgba(102, 82, 217, 0.14);
+  --accent-violet-glow: rgba(102, 82, 217, 0.16);
+  --accent-cyan-bright: #C4B5FD;
+  --primary-button-bg: #7652E8;
+  --primary-button-hover: #8767F2;
+  --secondary-accent: #6652D9;
+  --muted-purple: #51416F;
+  --surface-primary: #191626;
+  --surface-elevated: #221D32;
 
   /* Functional Status Colors */
   --status-success: #35C98A;
@@ -49,12 +54,12 @@
   --status-warning-soft: rgba(243, 180, 95, 0.10);
   --status-error: #F06478;
   --status-error-soft: rgba(240, 100, 120, 0.10);
-  --status-scheduled: #13D9F2;
-  --status-scheduled-soft: rgba(19, 217, 242, 0.10);
-  --status-recovering: #A855F7;
-  --status-recovering-soft: rgba(168, 85, 247, 0.12);
-  --status-offline: #687589;
-  --status-offline-soft: rgba(104, 117, 137, 0.12);
+  --status-scheduled: #8B64FF;
+  --status-scheduled-soft: rgba(139, 100, 255, 0.14);
+  --status-recovering: #A78BFA;
+  --status-recovering-soft: rgba(167, 139, 250, 0.14);
+  --status-offline: #9189A6;
+  --status-offline-soft: rgba(145, 137, 166, 0.14);
 
   /* Typography Families */
   --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -111,10 +116,10 @@
   --radius-full: 9999px;
 
   /* Shadows (Restrained, subtle depth) */
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.35);
-  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
-  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
-  --shadow-chassis: 0 20px 60px rgba(0, 0, 0, 0.65), 0 0 30px rgba(19, 217, 242, 0.10);
+  --shadow-sm: 0 3px 10px rgba(0, 0, 0, 0.20);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.28);
+  --shadow-lg: 0 14px 34px rgba(0, 0, 0, 0.46);
+  --shadow-chassis: 0 20px 60px rgba(0, 0, 0, 0.46), 0 4px 18px rgba(139, 100, 255, 0.10);
 
   /* Layout Dimensions */
   --sidebar-width: 256px;

@@ -11,7 +11,7 @@
   border: 1px solid var(--border-color);
   border-radius: var(--radius-lg);
   padding: var(--space-5);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-md);
   transition: border-color var(--transition-fast);
   position: relative;
   overflow: hidden;
@@ -63,6 +63,7 @@
   display: flex;
   flex-direction: column;
   transition: border-color var(--transition-fast), transform var(--transition-fast);
+  box-shadow: var(--shadow-sm);
 }
 
 .kpi-card:hover {
@@ -81,12 +82,12 @@
   width: 32px;
   height: 32px;
   border-radius: var(--radius-md);
-  background: rgba(117, 102, 246, 0.12);
+  background: var(--accent-violet-soft);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--accent-violet);
-  border: 1px solid rgba(117, 102, 246, 0.24);
+  border: 1px solid var(--border-color);
 }
 
 .kpi-chip-badge {
@@ -104,7 +105,7 @@
 .kpi-chip-badge.cyan {
   background: var(--accent-cyan-soft);
   color: var(--accent-cyan);
-  border-color: rgba(19, 217, 242, 0.3);
+  border-color: var(--border-color);
 }
 
 .kpi-value {
@@ -160,31 +161,32 @@
   pointer-events: none;
 }
 
-/* Primary Button (Electric Cyan with Specular Highlight) */
+/* Primary Button */
 .btn-primary {
-  background: linear-gradient(135deg, #13D9F2 0%, #00B8D9 100%);
-  color: #040810;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  background: var(--primary-button-bg);
+  color: var(--text-primary);
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-sm);
   font-weight: 600;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, #38E3F8 0%, #00C5E8 100%);
-  box-shadow: 0 4px 16px rgba(19, 217, 242, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  background: var(--primary-button-hover);
+  box-shadow: var(--shadow-md);
   transform: translateY(-1px);
 }
 
 /* Outline Button (Glassmorphism) */
 .btn-outline {
-  background: rgba(255, 255, 255, 0.03);
-  border-color: rgba(255, 255, 255, 0.12);
+  background: #211B30;
+  border-color: var(--border-focus);
   color: var(--text-primary);
   backdrop-filter: blur(8px);
 }
 
 .btn-outline:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(19, 217, 242, 0.4);
+  background: var(--surface-hover);
+  border-color: var(--accent-violet);
   color: #FFFFFF;
   transform: translateY(-1px);
 }
@@ -334,7 +336,8 @@
   width: 100%;
   overflow-x: auto;
   border-radius: var(--radius-lg);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border-focus);
+  box-shadow: var(--shadow-sm);
   background-color: var(--panel-primary);
 }
 
@@ -351,7 +354,7 @@
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   background-color: var(--panel-secondary);
   border-bottom: 1px solid var(--border-color);
   white-space: nowrap;
@@ -384,7 +387,7 @@
 .data-table .cell-mono {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* ==========================================================================
@@ -444,7 +447,7 @@
   font-size: var(--text-sm);
   color: var(--text-primary);
   background-color: var(--panel-secondary);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border-focus);
   border-radius: var(--radius-md);
   transition: all var(--transition-fast);
 }
@@ -452,7 +455,8 @@
 .input:focus,
 .select:focus,
 .textarea:focus {
-  border-color: var(--border-focus);
+  border-color: var(--accent-cyan-hover);
+  box-shadow: var(--border-glow);
   outline: none;
 }
 
@@ -465,6 +469,34 @@
 .textarea {
   min-height: 110px;
   resize: vertical;
+}
+
+::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+input[type="range"] {
+  accent-color: var(--accent-cyan-hover);
+  height: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-full);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  width: 16px;
+  height: 16px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--accent-cyan-hover);
+  border: 3px solid var(--surface-active);
+  border-radius: 50%;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.36);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent-cyan-hover);
 }
 
 /* ==========================================================================

@@ -8,33 +8,72 @@
 import { state } from '../state.js';
 import { getIcon } from '../utils/icons.js';
 import { formatNumber, getStatusBadgeHTML, timeAgo } from '../utils/formatters.js';
-import { renderSplineAreaChart, renderResourceMixDonut } from '../utils/charts.js';
+import { renderSplineAreaChart, updateSplineAreaChart, renderResourceMixDonut } from '../utils/charts.js';
 import { openJobModal } from '../components/job-modal.js';
 import { openJobDrawer } from '../components/job-drawer.js';
 
-// Telemetry dataset presets for interactive rapt.ai tabs
-const telemetryDatasets = {
-  usage: {
-    points: [42, 58, 76, 91, 84, 69, 58, 88, 72, 64],
-    strokeColor: '#7566F6',
-    gradId: 'telemetry_usage_grad',
-    label: 'GPU Utilization (%)'
+const telemetryMetrics = {
+  cpu: {
+    metric: 'cpu',
+    dashboardKey: 'cpu_utilization',
+    strokeColor: '#35C98A',
+    gradId: 'telemetry_cpu_grad',
+    label: 'CPU utilization (%)'
   },
   memory: {
-    points: [55, 62, 68, 74, 80, 85, 82, 79, 84, 88],
-    strokeColor: '#13D9F2',
+    metric: 'ram',
+    dashboardKey: 'ram_utilization',
+    strokeColor: '#6652D9',
     gradId: 'telemetry_mem_grad',
-    label: 'VRAM Allocation (%)'
+    label: 'System memory utilization (%)'
   },
-  temp: {
-    points: [48, 51, 54, 62, 66, 68, 67, 69, 65, 63],
-    strokeColor: '#F3B45F',
-    gradId: 'telemetry_temp_grad',
-    label: 'Core Temperature (°C)'
+  gpu_compute: {
+    metric: 'gpu_compute',
+    dashboardKey: 'gpu_compute_utilization',
+    strokeColor: '#13D9F2',
+    gradId: 'telemetry_gpu_compute_grad',
+    label: 'GPU compute utilization (%)'
+  },
+  gpu_memory: {
+    metric: 'gpu_memory',
+    dashboardKey: 'gpu_memory_utilization',
+    strokeColor: '#8B64FF',
+    gradId: 'telemetry_gpu_memory_grad',
+    label: 'GPU memory utilization (%)'
   }
 };
 
-let currentTelemetryTab = 'usage';
+let currentTelemetryTab = 'gpu_memory';
+
+function telemetryDatasetFor(tab) {
+  const metric = telemetryMetrics[tab];
+  const history = state.telemetryHistory || {};
+  const timestamps = history.timestamps || [];
+  const historicalPoints = history[metric.metric] || [];
+  const latestRaw = state.dashboard?.[metric.dashboardKey];
+  const latestValue = latestRaw == null ? null : Number(latestRaw);
+  const hasLatestValue = latestValue !== null && Number.isFinite(latestValue);
+  const points = historicalPoints.length > 0
+    ? historicalPoints
+    : (hasLatestValue ? [latestValue] : []);
+  const sampleTimes = timestamps.slice(-points.length);
+
+  return {
+    ...metric,
+    points,
+    timestamps: sampleTimes,
+    labels: sampleTimes.map(timestamp => new Date(timestamp).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }))
+  };
+}
+
+function percent(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? Math.max(0, Math.min(100, Math.round(numericValue))) : 0;
+}
 
 export function renderOverviewPage() {
   const dash = state.dashboard || {};
@@ -56,12 +95,14 @@ export function renderOverviewPage() {
 
   const recentJobs = dash.recent_jobs?.length > 0 ? dash.recent_jobs : jobs.slice(0, 6);
 
-  // Resource mix segments (rapt.ai donut)
+  const telemetryDataset = telemetryDatasetFor(currentTelemetryTab);
+
+  // Live resource mix derived from provider heartbeat utilization.
   const resourceSegments = [
-    { label: 'GPU Compute', value: 78, color: '#13D9F2' },
-    { label: 'GPU Memory', value: 65, color: '#7566F6' },
-    { label: 'CPU Usage', value: 42, color: '#35C98A' },
-    { label: 'Network I/O', value: 28, color: '#F3B45F' }
+    { label: 'GPU Memory', value: percent(dash.gpu_utilization), color: '#8B64FF' },
+    { label: 'System Memory', value: percent(dash.ram_utilization), color: '#6652D9' },
+    { label: 'CPU Usage', value: percent(dash.cpu_utilization), color: '#A78BFA' },
+    { label: 'Disk Usage', value: percent(dash.disk_utilization), color: '#51416F' }
   ];
 
   return `
@@ -101,7 +142,7 @@ export function renderOverviewPage() {
         <div class="kpi-card">
           <div class="kpi-top">
             <span class="kpi-label">Active Workloads</span>
-            <span class="kpi-chip-badge" style="background: rgba(19, 217, 242, 0.12); color: var(--accent-cyan); border-color: rgba(19, 217, 242, 0.25);">
+            <span class="kpi-chip-badge" style="background: var(--accent-cyan-soft); color: var(--accent-cyan); border-color: var(--border-color);">
               DISPATCHED
             </span>
           </div>
@@ -123,7 +164,7 @@ export function renderOverviewPage() {
         <div class="kpi-card">
           <div class="kpi-top">
             <span class="kpi-label">Available Tokens</span>
-            <span class="kpi-chip-badge" style="background: rgba(117, 102, 246, 0.12); color: var(--accent-violet); border-color: rgba(117, 102, 246, 0.25);">
+            <span class="kpi-chip-badge" style="background: var(--accent-violet-soft); color: var(--accent-violet); border-color: var(--border-color);">
               CREDITS
             </span>
           </div>
@@ -138,25 +179,28 @@ export function renderOverviewPage() {
         <div class="card" style="margin-bottom: 0;">
           <div class="chart-card-header">
             <div class="chart-title-wrap">
-              <span class="chart-title">Cluster Telemetry & GPU Load</span>
-              <span class="chart-subtitle">Continuous time-series aggregate from compute workers</span>
+              <span class="chart-title">Cluster Telemetry</span>
+              <span class="chart-subtitle">${telemetryDataset.label} from provider heartbeats</span>
             </div>
 
             <!-- rapt.ai Interactive Metric Tabs -->
             <div class="chart-tabs">
-              <button class="chart-tab-btn ${currentTelemetryTab === 'usage' ? 'active' : ''}" data-tab="usage">Usage</button>
+              <button class="chart-tab-btn ${currentTelemetryTab === 'cpu' ? 'active' : ''}" data-tab="cpu">CPU</button>
               <button class="chart-tab-btn ${currentTelemetryTab === 'memory' ? 'active' : ''}" data-tab="memory">Memory</button>
-              <button class="chart-tab-btn ${currentTelemetryTab === 'temp' ? 'active' : ''}" data-tab="temp">Temp</button>
+              <button class="chart-tab-btn ${currentTelemetryTab === 'gpu_compute' ? 'active' : ''}" data-tab="gpu_compute">GPU Compute</button>
+              <button class="chart-tab-btn ${currentTelemetryTab === 'gpu_memory' ? 'active' : ''}" data-tab="gpu_memory">GPU Memory</button>
             </div>
           </div>
 
           <!-- Canvas Container -->
           <div class="chart-canvas-wrap" id="telemetry-chart-wrap">
             ${renderSplineAreaChart(
-              telemetryDatasets[currentTelemetryTab].points,
+              telemetryDataset.points,
               {
-                strokeColor: telemetryDatasets[currentTelemetryTab].strokeColor,
-                gradId: telemetryDatasets[currentTelemetryTab].gradId
+                strokeColor: telemetryDataset.strokeColor,
+                gradId: telemetryDataset.gradId,
+                labels: telemetryDataset.labels,
+                timestamps: telemetryDataset.timestamps
               }
             )}
           </div>
@@ -268,28 +312,53 @@ export function initOverviewEvents() {
     });
   });
 
-  // rapt.ai Chart Tab switching
-  const tabButtons = document.querySelectorAll('.chart-tab-btn');
+  // One delegated listener per mounted tab group; repeated init calls on the
+  // same dashboard node cannot stack duplicate chart-switch handlers.
+  const chartTabs = document.querySelector('.chart-tabs');
   const chartWrap = document.getElementById('telemetry-chart-wrap');
 
-  tabButtons.forEach(btn => {
-    btn.addEventListener('click', () => {
+  if (chartTabs && chartTabs.dataset.telemetryBound !== 'true') {
+    chartTabs.dataset.telemetryBound = 'true';
+    chartTabs.addEventListener('click', event => {
+      const btn = event.target.closest?.('.chart-tab-btn');
+      if (!btn || !chartTabs.contains(btn)) return;
       const tab = btn.getAttribute('data-tab');
-      if (!tab || !telemetryDatasets[tab]) return;
+      if (!tab || !telemetryMetrics[tab]) return;
 
       currentTelemetryTab = tab;
-      tabButtons.forEach(b => b.classList.remove('active'));
+      chartTabs.querySelectorAll('.chart-tab-btn').forEach(button => button.classList.remove('active'));
       btn.classList.add('active');
 
       if (chartWrap) {
+        const telemetryDataset = telemetryDatasetFor(tab);
+        const subtitle = document.querySelector('.chart-subtitle');
+        if (subtitle) subtitle.textContent = `${telemetryDataset.label} from provider heartbeats`;
         chartWrap.innerHTML = renderSplineAreaChart(
-          telemetryDatasets[tab].points,
+          telemetryDataset.points,
           {
-            strokeColor: telemetryDatasets[tab].strokeColor,
-            gradId: telemetryDatasets[tab].gradId
+            strokeColor: telemetryDataset.strokeColor,
+            gradId: telemetryDataset.gradId,
+            labels: telemetryDataset.labels,
+            timestamps: telemetryDataset.timestamps
           }
         );
       }
     });
+  }
+}
+
+/** Refresh the selected telemetry series in place when a real backend sample arrives. */
+export function updateTelemetryChart() {
+  const chartWrap = document.getElementById('telemetry-chart-wrap');
+  const metric = telemetryMetrics[currentTelemetryTab];
+  if (!chartWrap || !metric) return;
+  const dataset = telemetryDatasetFor(currentTelemetryTab);
+  const subtitle = document.querySelector('.chart-subtitle');
+  if (subtitle) subtitle.textContent = `${dataset.label} from provider heartbeats`;
+  updateSplineAreaChart(chartWrap, dataset.points, {
+    strokeColor: dataset.strokeColor,
+    gradId: dataset.gradId,
+    labels: dataset.labels,
+    timestamps: dataset.timestamps
   });
 }

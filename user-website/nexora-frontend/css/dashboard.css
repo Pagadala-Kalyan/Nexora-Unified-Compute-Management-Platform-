@@ -28,6 +28,8 @@
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   padding: 3px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .chart-tab-btn {
@@ -75,6 +77,52 @@
   height: 230px;
   position: relative;
   margin-top: var(--space-2);
+}
+
+.telemetry-chart-svg {
+  overflow: hidden;
+}
+
+.telemetry-chart-line,
+.telemetry-chart-area {
+  transition: opacity 160ms ease;
+}
+
+.telemetry-updating .telemetry-chart-line {
+  stroke-width: 2.1;
+}
+
+.telemetry-chart-point {
+  outline: none;
+}
+
+.telemetry-chart-hit {
+  fill: transparent;
+  pointer-events: all;
+}
+
+.telemetry-chart-highlight {
+  fill: var(--panel-primary);
+  stroke-width: 1.8;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.telemetry-chart-point:hover .telemetry-chart-highlight,
+.telemetry-chart-point:focus .telemetry-chart-highlight {
+  opacity: 1;
+}
+
+@media (max-width: 760px) {
+  .chart-card-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .chart-tabs {
+    justify-content: flex-start;
+  }
 }
 
 /* Right Chart Card: Resource Mix Donut */

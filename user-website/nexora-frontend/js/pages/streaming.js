@@ -12,7 +12,6 @@ import {
   stopStreamSession
 } from '../api.js';
 
-let streamPollTimer = null;
 let currentSession = null;
 
 const PLATFORM_PRESETS = {
@@ -75,20 +74,9 @@ export async function initStreamingEvents() {
 
   // Load initial state
   await fetchAndRenderStreamState();
-
-  // Poll active session every 3 seconds
-  if (streamPollTimer) clearInterval(streamPollTimer);
-  streamPollTimer = setInterval(() => {
-    // Only poll if on streaming page
-    if (window.location.hash.includes('streaming')) {
-      fetchAndRenderStreamState(true);
-    } else {
-      clearInterval(streamPollTimer);
-    }
-  }, 3500);
 }
 
-async function fetchAndRenderStreamState(isBackground = false) {
+async function fetchAndRenderStreamState() {
   const container = document.getElementById('stream-studio-content');
   if (!container) return;
 
@@ -96,25 +84,33 @@ async function fetchAndRenderStreamState(isBackground = false) {
     const data = await getActiveStreamSession();
     if (data && data.active && data.session) {
       currentSession = data.session;
+      state.streamSession = data.session;
       renderActiveSession(container, data.session);
     } else {
       currentSession = null;
+      state.streamSession = null;
       renderSetupForm(container);
     }
   } catch (err) {
-    if (!isBackground) {
-      container.innerHTML = `
-        <div class="empty-state-card">
-          <div class="empty-icon">${getIcon('alert')}</div>
-          <h3>Failed to load streaming status</h3>
-          <p class="text-muted">${err.message || 'Please check backend connectivity.'}</p>
-          <button class="btn btn-primary btn-sm" id="btn-retry-stream">Retry</button>
-        </div>
-      `;
-      const retryBtn = document.getElementById('btn-retry-stream');
-      if (retryBtn) retryBtn.addEventListener('click', () => fetchAndRenderStreamState());
-    }
+    container.innerHTML = `
+      <div class="empty-state-card">
+        <div class="empty-icon">${getIcon('alert')}</div>
+        <h3>Failed to load streaming status</h3>
+        <p class="text-muted">${err.message || 'Please check backend connectivity.'}</p>
+        <button class="btn btn-primary btn-sm" id="btn-retry-stream">Retry</button>
+      </div>
+    `;
+    const retryBtn = document.getElementById('btn-retry-stream');
+    if (retryBtn) retryBtn.addEventListener('click', () => fetchAndRenderStreamState());
   }
+}
+
+export function updateStreamingView() {
+  const container = document.getElementById('stream-studio-content');
+  if (!container) return;
+  currentSession = state.streamSession || null;
+  if (currentSession) renderActiveSession(container, currentSession);
+  else renderSetupForm(container);
 }
 
 function renderActiveSession(container, session) {
@@ -405,6 +401,7 @@ function renderSetupForm(container) {
       const result = await createStreamSession(payload);
       showToast('Remote stream session allocated successfully!', 'success');
       currentSession = result;
+      state.streamSession = result;
       const container = document.getElementById('stream-studio-content');
       if (container) renderActiveSession(container, result);
     } catch (err) {

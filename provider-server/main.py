@@ -408,57 +408,48 @@ def utilization():
         ).percent
     )
 
-    gpu_percent = 0
+    gpu_memory_percent = None
+    gpu_compute_percent = None
 
+    # nvidia-smi reports device-wide hardware utilization and memory, including
+    # work from processes other than this provider agent.
     try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2, check=True
+        )
+        compute_values = []
+        memory_values = []
+        for line in result.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 3 or any(value in ("", "N/A", "[Not Supported]") for value in fields):
+                continue
+            compute, used_mb, total_mb = (float(value) for value in fields)
+            if total_mb > 0:
+                compute_values.append(compute)
+                memory_values.append(used_mb / total_mb * 100)
+        if compute_values:
+            gpu_compute_percent = round(sum(compute_values) / len(compute_values), 1)
+            gpu_memory_percent = round(sum(memory_values) / len(memory_values), 1)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
 
-        if (
-            SYSTEM_INFO["cuda_available"]
-            and importlib.util.find_spec("torch")
-        ):
-
-            import torch
-
-            gpu_values = []
-
-            for index in range(
-                torch.cuda.device_count()
-            ):
-
-                allocated = (
-                    torch.cuda.memory_allocated(index)
-                )
-
-                reserved = (
-                    torch.cuda.memory_reserved(index)
-                )
-
-                total = (
-                    torch.cuda.get_device_properties(index)
-                    .total_memory
-                )
-
-                used = max(
-                    allocated,
-                    reserved
-                )
-
-                if total > 0:
-
-                    gpu_values.append(
-                        used / total * 100
-                    )
-
-            if gpu_values:
-
-                gpu_percent = round(
-                    sum(gpu_values)
-                    / len(gpu_values),
-                    1
-                )
-
-    except Exception:
-        gpu_percent = 0
+    # Torch allocator usage is a truthful fallback for this process' own GPU
+    # memory only. GPU compute stays unavailable when hardware telemetry is absent.
+    if gpu_memory_percent is None:
+        try:
+            if SYSTEM_INFO["cuda_available"] and importlib.util.find_spec("torch"):
+                import torch
+                memory_values = []
+                for index in range(torch.cuda.device_count()):
+                    total = torch.cuda.get_device_properties(index).total_memory
+                    used = max(torch.cuda.memory_allocated(index), torch.cuda.memory_reserved(index))
+                    if total > 0:
+                        memory_values.append(used / total * 100)
+                if memory_values:
+                    gpu_memory_percent = round(sum(memory_values) / len(memory_values), 1)
+        except Exception:
+            pass
 
     return {
 
@@ -466,7 +457,11 @@ def utilization():
 
         "ram": ram_percent,
 
-        "gpu": gpu_percent,
+        "gpu": gpu_memory_percent,
+
+        "gpu_memory": gpu_memory_percent,
+
+        "gpu_compute": gpu_compute_percent,
 
         "disk": disk_percent
     }

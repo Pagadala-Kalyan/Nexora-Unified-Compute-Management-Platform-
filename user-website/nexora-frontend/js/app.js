@@ -6,6 +6,7 @@
  */
 
 import { state, subscribe, startPolling, stopPolling, refreshAll, setTheme, toggleSidebar } from './state.js';
+import { startRealtime, stopRealtime } from './realtime.js';
 import { isAuthenticated, openAuthModal } from './auth.js';
 import { initRouter, handleRoute, getCurrentRoute } from './router.js';
 import { showToast } from './components/toast.js';
@@ -37,6 +38,18 @@ function patchShellData() {
       : health.status.toUpperCase();
   }
 
+  const realtimePill = document.getElementById('realtime-status-pill');
+  if (realtimePill) {
+    const realtime = state.realtime.status;
+    realtimePill.className = `realtime-status-pill ${realtime === 'connected' ? 'connected' : 'stale'}`;
+    realtimePill.textContent = realtime === 'connected'
+      ? 'Live updates'
+      : realtime === 'syncing' || realtime === 'connecting'
+        ? 'Syncing…'
+        : 'Reconnecting · data may be stale';
+    realtimePill.title = realtime === 'connected' ? 'Connected to live event stream' : 'Live updates are unavailable; using bounded REST reconciliation';
+  }
+
   // 3. Update sidebar system status node count
   const nodeCountEl = document.querySelector('.status-widget-metrics span:last-child');
   if (nodeCountEl) {
@@ -63,9 +76,41 @@ let _renderPending = false;
 let _renderTimer = null;
 
 function scheduleContentRefresh(notifyKey) {
+  // Telemetry events only patch the existing SVG series. Keeping the overview
+  // DOM intact prevents page-level flicker between provider heartbeats.
+  if (notifyKey === 'telemetry') {
+    patchShellData();
+    if (getCurrentRoute() === 'overview') {
+      import('./pages/overview.js').then(module => module.updateTelemetryChart())
+        .catch(error => console.warn('Telemetry chart update error:', error));
+    }
+    return;
+  }
+
   // Health-only updates: patch in-place, don't queue a full content re-render
   if (notifyKey === 'clusterHealth') {
     patchShellData();
+    return;
+  }
+
+  if (notifyKey === 'realtime-status') {
+    patchShellData();
+    return;
+  }
+
+  if (notifyKey === 'stream') {
+    patchShellData();
+    if (getCurrentRoute() === 'streaming') {
+      import('./pages/streaming.js').then(module => module.updateStreamingView())
+        .catch(error => console.warn('Streaming view update error:', error));
+    }
+    return;
+  }
+
+  if (notifyKey === 'all' && getCurrentRoute() === 'streaming') {
+    patchShellData();
+    import('./pages/streaming.js').then(module => module.updateStreamingView())
+      .catch(error => console.warn('Streaming view update error:', error));
     return;
   }
 
@@ -120,6 +165,7 @@ function refreshPageContent() {
     'billing':       () => import('./pages/billing.js').then(m => ({ render: m.renderBillingPage, init: m.initBillingEvents })),
     'analytics':     () => import('./pages/analytics.js').then(m => ({ render: m.renderAnalyticsPage, init: m.initAnalyticsEvents })),
     'settings':      () => import('./pages/settings.js').then(m => ({ render: m.renderSettingsPage, init: m.initSettingsEvents })),
+    'streaming':     () => import('./pages/streaming.js').then(m => ({ render: m.renderStreamingPage, init: m.initStreamingEvents })),
     'home':          null, // landing page doesn't need live refresh
     'landing':       null,
   };
@@ -130,7 +176,18 @@ function refreshPageContent() {
   loader().then(({ render, init }) => {
     const container = document.getElementById('page-content');
     if (!container) return;
+    const existingTelemetryChart = route === 'overview'
+      ? container.querySelector('#telemetry-chart-wrap')
+      : null;
     container.innerHTML = render();
+    const replacementChart = route === 'overview'
+      ? container.querySelector('#telemetry-chart-wrap')
+      : null;
+    if (existingTelemetryChart && replacementChart) {
+      replacementChart.replaceWith(existingTelemetryChart);
+      import('./pages/overview.js').then(module => module.updateTelemetryChart())
+        .catch(error => console.warn('Telemetry chart update error:', error));
+    }
     if (init) {
       try { init(); } catch (e) { console.warn('Page init error:', e); }
     }
@@ -153,6 +210,7 @@ function initApp() {
   // 3. Handle Session Expiry (401 loop fix)
   window.addEventListener('nexora:session-expired', (e) => {
     stopPolling();
+    stopRealtime();
     showToast(e.detail?.message || 'Session expired. Please sign in again.', 'warning', 5000);
     // Only prompt login if the user is currently in a console route, not the public landing page
     const route = getCurrentRoute();
@@ -166,9 +224,11 @@ function initApp() {
     if (e.detail?.user) {
       showToast(`Welcome back, ${e.detail.user.email}!`, 'success');
       startPolling();
+      startRealtime();
     } else {
       showToast('Signed out of Nexora Control Plane.', 'info');
       stopPolling();
+      stopRealtime();
       // On signout, smoothly take the user to the public landing page (no blocking modal)
       window.location.hash = '#/home';
     }
@@ -204,8 +264,11 @@ function initApp() {
   // 7. Initialize Router (renders shell + page for current hash)
   initRouter();
 
-  // 8. Start Telemetry Polling
-  startPolling();
+  // 8. Start REST reconciliation and the shared realtime event connection.
+  if (isAuthenticated()) {
+    startPolling();
+    startRealtime();
+  }
 
   // 9. Default to public landing page if no hash is present
   if (!window.location.hash || window.location.hash === '#' || window.location.hash === '#/') {

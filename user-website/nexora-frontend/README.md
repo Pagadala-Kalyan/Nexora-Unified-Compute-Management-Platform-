@@ -41,7 +41,7 @@ A modern, high-performance web interface for the **Nexora Unified Compute Manage
   * Workload distribution breakdown bar and status distribution summary.
 * **Settings & Session Management**:
   * Interactive theme card switcher.
-  * Live telemetry polling cadence selector (2s, 4s, 8s, or Paused).
+  * Disconnected-state REST reconciliation cadence selector (15s, 30s, or manual).
   * Control plane URL override and clean session termination.
 
 ---
@@ -50,6 +50,28 @@ A modern, high-performance web interface for the **Nexora Unified Compute Manage
 
 Previously, expired JWT tokens stored in `localStorage` caused endless 401 error cascades.
 The new API client (`js/api.js`) intercepts HTTP 401 responses, removes expired tokens from `localStorage`, stops active polling timers, shows an informative notification, and renders the authentication modal without page reloading or infinite request loops.
+
+---
+
+## Real-time Control-plane Updates
+
+The console opens one authenticated WebSocket connection to `/ws/realtime` after
+sign-in and subscribes to telemetry, provider/resource, job, checkpoint, billing,
+and stream events. The subscription is acknowledged before the client takes an
+authoritative REST snapshot; events received during that snapshot are replayed
+after it so a concurrent change is not lost. While connected, live pages do not
+poll. If the socket disconnects, REST reconciliation runs at the selected bounded
+interval; reconnecting repeats the snapshot-and-replay sync. Provider devices
+continue to report heartbeats to the control plane over HTTP, independently of
+browser WebSockets.
+
+The token is carried in the WebSocket subprotocol header rather than in a query
+string. The backend accepts only authenticated, allowed-origin connections and
+limits per-user/global connections, event queue size, inbound message size, and
+inbound message rate. Slow clients are disconnected and must resync rather than
+silently receiving an incomplete event stream. The in-memory event fan-out is for
+a single control-plane process; multi-instance deployment requires a shared
+broker so events reach sockets connected to other instances.
 
 ---
 

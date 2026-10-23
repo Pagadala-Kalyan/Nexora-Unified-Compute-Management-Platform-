@@ -252,7 +252,7 @@ export function renderLandingPage() {
                 Evaluates algorithmic constraints against live provider telemetry. Filters candidates by required CPU cores, RAM, and GPU memory, then ranks eligible nodes using deterministic cost-per-hour and reliability scoring.
               </p>
             </div>
-            <div class="capability-badge-pill" style="color: var(--accent-cyan); border-color: rgba(19, 217, 242, 0.25); background: rgba(19, 217, 242, 0.08);">
+            <div class="capability-badge-pill" style="color: var(--accent-cyan); border-color: var(--border-color); background: var(--accent-cyan-soft);">
               Cost &amp; Reliability Ranking
             </div>
           </div>

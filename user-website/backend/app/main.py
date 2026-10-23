@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import asynccontextmanager
 import base64
 import hashlib
 import ipaddress
@@ -14,11 +16,13 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from dataclasses import dataclass, field
 from typing import Optional
 
 from cryptography.fernet import Fernet
 import jwt
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -304,10 +308,156 @@ class StreamHeartbeatPayload(BaseModel):
     metrics: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
-app=FastAPI(title="Nexora UCMP Control Plane", version="0.1.0")
+@asynccontextmanager
+async def app_lifespan(app):
+    realtime_hub.loop = asyncio.get_running_loop()
+    Base.metadata.create_all(engine)
+    session = SessionLocal()
+    try:
+        ensure_schema_columns(session)
+        for user in session.query(User).all():
+            wallet_for(session, user.id)
+        session.commit()
+    finally:
+        session.close()
+
+    recovery_stop = threading.Event()
+    recovery_thread = threading.Thread(
+        target=recover_lost_providers,
+        args=(recovery_stop,),
+        daemon=True,
+        name="provider-recovery-monitor"
+    )
+    recovery_thread.start()
+    try:
+        yield
+    finally:
+        recovery_stop.set()
+        recovery_thread.join(timeout=6)
+        await realtime_hub.close_all()
+        realtime_hub.loop = None
+
+app=FastAPI(title="Nexora UCMP Control Plane", version="0.1.0", lifespan=app_lifespan)
 # Allow any local development port (Vite/Next commonly choose a different port
 # when one is occupied) while keeping remote browser origins explicitly blocked.
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000").split(","), allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX", r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.vercel\.app"), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Realtime events are deliberately kept inside the control plane. REST remains the
+# source of truth; this bounded fan-out layer only distributes already-committed
+# state changes to authenticated dashboard sessions.
+REALTIME_MAX_PENDING_EVENTS = int(os.getenv("REALTIME_MAX_PENDING_EVENTS", "100"))
+REALTIME_MAX_MESSAGE_BYTES = int(os.getenv("REALTIME_MAX_MESSAGE_BYTES", "8192"))
+REALTIME_MAX_EVENT_BYTES = int(os.getenv("REALTIME_MAX_EVENT_BYTES", "65536"))
+REALTIME_MAX_MESSAGES_PER_MINUTE = int(os.getenv("REALTIME_MAX_MESSAGES_PER_MINUTE", "60"))
+REALTIME_MAX_CONNECTIONS_PER_USER = int(os.getenv("REALTIME_MAX_CONNECTIONS_PER_USER", "5"))
+REALTIME_MAX_CONNECTIONS = int(os.getenv("REALTIME_MAX_CONNECTIONS", "1000"))
+REALTIME_TOPICS = {"telemetry", "providers", "jobs", "checkpoints", "billing", "resources", "streams"}
+
+@dataclass(eq=False)
+class RealtimeClient:
+    user_id: int
+    websocket: WebSocket
+    topics: set[str] = field(default_factory=set)
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=REALTIME_MAX_PENDING_EVENTS))
+    sender_task: Optional[asyncio.Task] = None
+    messages_in_window: int = 0
+    window_started: float = field(default_factory=time.monotonic)
+
+class RealtimeEventHub:
+    def __init__(self):
+        self.clients: set[RealtimeClient] = set()
+        self.lock = asyncio.Lock()
+        self.sequence = 0
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def connect(self, websocket: WebSocket, user_id: int) -> RealtimeClient:
+        async with self.lock:
+            user_connections = sum(client.user_id == user_id for client in self.clients)
+            if len(self.clients) >= REALTIME_MAX_CONNECTIONS or user_connections >= REALTIME_MAX_CONNECTIONS_PER_USER:
+                raise ConnectionError("WebSocket connection limit reached")
+            await websocket.accept(subprotocol="nexora.realtime.v1")
+            client = RealtimeClient(user_id=user_id, websocket=websocket)
+            self.clients.add(client)
+            client.sender_task = asyncio.create_task(self._send_events(client))
+        return client
+
+    async def disconnect(self, client: RealtimeClient):
+        async with self.lock:
+            self.clients.discard(client)
+        if client.sender_task and client.sender_task is not asyncio.current_task():
+            client.sender_task.cancel()
+            await asyncio.gather(client.sender_task, return_exceptions=True)
+
+    async def close_all(self):
+        async with self.lock:
+            clients = list(self.clients)
+            self.clients.clear()
+        for client in clients:
+            try:
+                await client.websocket.close(code=1001, reason="Control plane shutting down")
+            except (RuntimeError, WebSocketDisconnect):
+                pass
+            if client.sender_task:
+                client.sender_task.cancel()
+        tasks = [client.sender_task for client in clients if client.sender_task]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _send_events(self, client: RealtimeClient):
+        try:
+            while True:
+                await client.websocket.send_json(await client.queue.get())
+        except (WebSocketDisconnect, RuntimeError, TypeError, ValueError):
+            pass
+        finally:
+            await self.disconnect(client)
+
+    async def publish(self, event_type: str, data: dict, *, topic: str, user_id: Optional[int] = None,
+                      provider_id: Optional[str] = None, job_id: Optional[str] = None):
+        if topic not in REALTIME_TOPICS:
+            raise ValueError(f"Unknown realtime topic: {topic}")
+        async with self.lock:
+            self.sequence += 1
+            event = {
+                "event_id": f"evt_{secrets.token_hex(12)}",
+                "type": event_type,
+                "topic": topic,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "sequence": self.sequence,
+                "provider_id": provider_id,
+                "job_id": job_id,
+                "data": data,
+            }
+            event = jsonable_encoder(event)
+            # A WebSocket notification is a hint, not an artifact transport.
+            # Oversized data remains available through the authenticated REST API.
+            if len(json.dumps(event, default=str).encode("utf-8")) > REALTIME_MAX_EVENT_BYTES:
+                event["data"] = {"resync_required": True}
+                event["requires_resync"] = True
+            recipients = [c for c in self.clients if topic in c.topics and (user_id is None or c.user_id == user_id)]
+        for client in recipients:
+            if client.queue.full():
+                # Never silently discard a state transition. Close slow clients
+                # so their reconnect path performs an authoritative resync.
+                try:
+                    await client.websocket.close(code=1013, reason="Realtime backlog; reconnect to resync")
+                except (RuntimeError, WebSocketDisconnect):
+                    pass
+                await self.disconnect(client)
+                continue
+            try: client.queue.put_nowait(event)
+            except asyncio.QueueFull: pass
+
+    def publish_from_sync(self, event_type: str, data: dict, *, topic: str, user_id: Optional[int] = None,
+                          provider_id: Optional[str] = None, job_id: Optional[str] = None):
+        if not self.loop or self.loop.is_closed():
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self.publish(event_type, data, topic=topic, user_id=user_id, provider_id=provider_id, job_id=job_id), self.loop
+        )
+        future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+
+realtime_hub = RealtimeEventHub()
 # The Vite dashboard remains the currently served app while the exact Next.js
 # authentication template is prepared in user-website/frontend-next.
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend-vite-backup" / "dist"
@@ -331,6 +481,20 @@ def token_ledger(s,wallet,kind,amount,reference_type,reference_id,description,jo
     wallet.token_balance=after
     s.add(TokenTransaction(id=f"tok_{secrets.token_hex(8)}",user_id=wallet.user_id,wallet_id=wallet.id,job_id=job_id,type=kind,amount=amount,balance_before=before,balance_after=after,reference_type=reference_type,reference_id=reference_id,description=description))
     return after
+def billing_event_data(s, user_id):
+    wallet = wallet_for(s, user_id)
+    transaction = s.query(TokenTransaction).filter_by(user_id=user_id).order_by(TokenTransaction.created_at.desc(), TokenTransaction.id.desc()).first()
+    latest = None if not transaction else {
+        "id": transaction.id,
+        "type": transaction.type,
+        "amount": transaction.amount,
+        "balance_before": transaction.balance_before,
+        "balance_after": transaction.balance_after,
+        "reference_id": transaction.reference_id,
+        "description": transaction.description,
+        "created_at": transaction.created_at,
+    }
+    return {"token_balance": wallet.token_balance, "transaction": latest}
 def estimate_tokens(requirements, provider):
     workload = requirements.get("workload")
     if workload == "video_compress":
@@ -361,6 +525,89 @@ def current_user(authorization: str=Header(...), s:Session=Depends(db)):
     except Exception: raise HTTPException(401,"Invalid or expired session")
     if not user: raise HTTPException(401,"User not found")
     return user
+
+def websocket_user(websocket: WebSocket) -> Optional[User]:
+    """Authenticate a browser WebSocket without placing a bearer token in its URL."""
+    protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
+    credential = next((item.removeprefix("nexora.jwt.") for item in protocols if item.startswith("nexora.jwt.")), None)
+    if not credential:
+        return None
+    s = SessionLocal()
+    try:
+        payload = jwt.decode(credential, JWT_SECRET, algorithms=["HS256"])
+        session = s.get(AuthSession, payload["sid"])
+        if not session or session.revoked or session.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+            return None
+        user_id = int(payload["sub"])
+        if session.user_id != user_id:
+            return None
+        return s.get(User, user_id)
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+def websocket_origin_allowed(websocket: WebSocket) -> bool:
+    origin = websocket.headers.get("origin")
+    # Non-browser clients and tests do not send Origin. Browser origins are
+    # constrained to the same allow-list shape as HTTP CORS.
+    if not origin:
+        return True
+    configured = {item.rstrip("/") for item in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000").split(",")}
+    if origin.rstrip("/") in configured:
+        return True
+    return bool(re.fullmatch(os.getenv("CORS_ORIGIN_REGEX", r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.vercel\.app"), origin))
+
+@app.websocket("/ws/realtime")
+async def realtime_websocket(websocket: WebSocket):
+    if not websocket_origin_allowed(websocket):
+        await websocket.close(code=1008, reason="Origin is not allowed")
+        return
+    user = websocket_user(websocket)
+    if not user:
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+    try:
+        client = await realtime_hub.connect(websocket, user.id)
+    except ConnectionError:
+        await websocket.close(code=1013, reason="Connection limit reached; retry shortly")
+        return
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            now = time.monotonic()
+            if now - client.window_started >= 60:
+                client.window_started, client.messages_in_window = now, 0
+            client.messages_in_window += 1
+            if client.messages_in_window > REALTIME_MAX_MESSAGES_PER_MINUTE:
+                await websocket.close(code=1008, reason="Rate limit exceeded")
+                return
+            if len(raw.encode("utf-8")) > REALTIME_MAX_MESSAGE_BYTES:
+                await websocket.close(code=1009, reason="Message too large")
+                return
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "system.error", "data": {"message": "Invalid JSON message"}})
+                continue
+            if not isinstance(message, dict):
+                await websocket.send_json({"type": "system.error", "data": {"message": "Message must be an object"}})
+                continue
+            if message.get("type") == "ping":
+                await websocket.send_json({"type": "system.pong", "timestamp": datetime.now(timezone.utc).isoformat()})
+            elif message.get("type") == "subscribe":
+                requested = message.get("topics", [])
+                if not isinstance(requested, list) or not requested or any(topic not in REALTIME_TOPICS for topic in requested):
+                    await websocket.send_json({"type": "system.error", "data": {"message": "Invalid subscription topics"}})
+                    continue
+                client.topics = set(requested)
+                await websocket.send_json({"type": "system.subscribed", "data": {"topics": sorted(client.topics)}})
+            else:
+                await websocket.send_json({"type": "system.error", "data": {"message": "Unsupported message type"}})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await realtime_hub.disconnect(client)
 def provider_auth(x_provider_token: str=Header(...)):
     valid = secrets.compare_digest(x_provider_token, PROVIDER_TOKEN) or secrets.compare_digest(x_provider_token, "local-demo-token")
     if not valid: raise HTTPException(401,"Provider authentication failed")
@@ -407,23 +654,26 @@ def compatible_provider(s, requirements, exclude_id=None):
         candidates.append(p)
 
     return min(candidates, key=lambda x: x.cost_per_hour / (max(x.reliability, 1) / 100)) if candidates else None
-def recover_lost_providers():
+def recover_lost_providers(stop_event: Optional[threading.Event] = None):
     """Detect provider loss and re-dispatch checkpointed controlled workloads with generation fencing."""
-    while True:
-        time.sleep(5)
+    stop_event = stop_event or threading.Event()
+    while not stop_event.wait(5):
         s=SessionLocal()
         try:
             now=datetime.now(timezone.utc)
+            provider_events=[]; job_events=[]; stream_events=[]; billing_users=set()
             for failed in s.query(Provider).filter(Provider.status.in_(["ONLINE","BUSY","AVAILABLE"])).all():
                 last=failed.last_heartbeat if failed.last_heartbeat.tzinfo else failed.last_heartbeat.replace(tzinfo=timezone.utc)
                 if (now-last).total_seconds() <= int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS","20")): continue
                 failed.status="OFFLINE"
+                provider_events.append(failed)
                 # Handle lost stream sessions on this provider
                 try:
                     for stream in s.query(StreamSession).filter(StreamSession.provider_id==failed.id, StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])).all():
                         stream.status = "FAILED"
                         stream.error_message = f"Provider {failed.name} disconnected unexpectedly."
                         stream.completed_at = now
+                        stream_events.append(stream)
                         add_audit(s, "stream.provider_lost", user_id=stream.user_id, provider_id=failed.id, details={"session_id": stream.id})
                 except Exception as sex:
                     print(f"[RECOVERY MONITOR STREAM ERROR] {sex}")
@@ -445,6 +695,7 @@ def recover_lost_providers():
                             "recovery_note": f"Recovered from {failed.name} to {replacement.name} (attempt {j.attempt})"
                         }
                         replacement.status = "BUSY"
+                        provider_events.append(replacement)
                         add_audit(s, "job.recovered", user_id=j.user_id, provider_id=replacement.id, job_id=j.id,
                                   details={"failed_provider": failed.id, "new_provider": replacement.id, "attempt": j.attempt, "checkpoint_id": checkpoint.id if checkpoint else None})
                     else:
@@ -453,7 +704,18 @@ def recover_lost_providers():
                         refund_reservation(s,j,f"Refund after provider loss for {j.name}")
                         add_audit(s, "job.failed_unrecoverable", user_id=j.user_id, provider_id=failed.id, job_id=j.id,
                                   details={"failed_provider": failed.id})
+                        billing_users.add(j.user_id)
+                    job_events.append(j)
             s.commit()
+            for provider in provider_events:
+                realtime_hub.publish_from_sync("provider.status_changed", {"provider": provider_data(provider)}, topic="providers", provider_id=provider.id)
+            for job in job_events:
+                event_type = "job.recovery_started" if job.status == "RECOVERING" else "job.failed"
+                realtime_hub.publish_from_sync(event_type, {"job": job_data(job,s)}, topic="jobs", user_id=job.user_id, provider_id=job.provider_id, job_id=job.id)
+            for stream in stream_events:
+                publish_stream_update(s, stream)
+            for user_id in billing_users:
+                realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, user_id), topic="billing", user_id=user_id)
         except Exception as ex:
             print(f"[RECOVERY MONITOR ERROR] {ex}")
         finally: s.close()
@@ -488,16 +750,6 @@ def ensure_schema_columns(s):
     except Exception as ex:
         print(f"[SCHEMA MIGRATION WARNING] {ex}")
 
-@app.on_event("startup")
-def init():
-    Base.metadata.create_all(engine)
-    s=SessionLocal()
-    try:
-        ensure_schema_columns(s)
-        for user in s.query(User).all(): wallet_for(s,user.id)
-        s.commit()
-    finally: s.close()
-    threading.Thread(target=recover_lost_providers,daemon=True,name="provider-recovery-monitor").start()
 @app.get("/health")
 def health(): return {"status":"ok","service":"nexora-control-plane"}
 @app.get("/", include_in_schema=False)
@@ -523,12 +775,31 @@ def provider_register(body:ProviderRegister,_=Depends(provider_auth),s:Session=D
     else:
         for k,v in data.items(): setattr(p,k,v)
         p.status="ONLINE"
-    s.commit();return provider_data(p)
+    s.commit()
+    payload = provider_data(p)
+    realtime_hub.publish_from_sync("provider.status_changed", {"provider": payload}, topic="providers", provider_id=p.id)
+    realtime_hub.publish_from_sync("resource_pool.updated", {"provider": payload}, topic="resources", provider_id=p.id)
+    return payload
 @app.post("/providers/{provider_id}/heartbeat")
 def heartbeat(provider_id:str,body:Heartbeat,_=Depends(provider_auth),s:Session=Depends(db)):
     p=s.get(Provider,provider_id)
     if not p: raise HTTPException(404,"Provider not registered")
-    p.status=body.status;p.utilization=body.utilization;p.last_heartbeat=datetime.now(timezone.utc);s.commit();return {"ok":True}
+    previous_status = p.status
+    p.status=body.status;p.utilization=body.utilization;p.last_heartbeat=datetime.now(timezone.utc);s.commit()
+    payload = provider_data(p)
+    # Existing provider agents report `gpu` as memory utilization. Preserve that
+    # meaning rather than labelling it as GPU compute load.
+    realtime_hub.publish_from_sync("telemetry.updated", {
+        "provider": payload,
+        "cpu_utilization": body.utilization.get("cpu"),
+        "ram_utilization": body.utilization.get("ram"),
+        "disk_utilization": body.utilization.get("disk"),
+        "gpu_memory_utilization": body.utilization.get("gpu_memory", body.utilization.get("gpu")),
+        "gpu_compute_utilization": body.utilization.get("gpu_compute"),
+    }, topic="telemetry", provider_id=p.id)
+    if previous_status != p.status:
+        realtime_hub.publish_from_sync("provider.status_changed", {"provider": payload}, topic="providers", provider_id=p.id)
+    return {"ok":True}
 @app.get("/jobs")
 def jobs(u:User=Depends(current_user),s:Session=Depends(db)): return [job_data(j,s) for j in s.query(Job).filter_by(user_id=u.id).order_by(Job.created_at.desc()).all()]
 @app.post("/jobs")
@@ -556,7 +827,12 @@ def create_job(body:JobCreate,u:User=Depends(current_user),s:Session=Depends(db)
         if art: art.job_id = j.id
     source=body.requirements.get("python_code","")
     if source.strip(): s.add(JobArtifact(id=f"art_{secrets.token_hex(8)}",job_id=j.id,user_id=u.id,filename=body.requirements.get("file_name",f"{j.name}.py"),content=source,size_bytes=len(source.encode("utf-8"))))
-    add_audit(s,"job.submitted",user_id=u.id,provider_id=p.id,job_id=j.id,details={"workload":body.workload,"estimated_tokens":estimated_tokens});s.commit();return job_data(j,s)
+    add_audit(s,"job.submitted",user_id=u.id,provider_id=p.id,job_id=j.id,details={"workload":body.workload,"estimated_tokens":estimated_tokens});s.commit()
+    payload = job_data(j,s)
+    realtime_hub.publish_from_sync("job.created", {"job": payload}, topic="jobs", user_id=u.id, provider_id=p.id, job_id=j.id)
+    realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, u.id), topic="billing", user_id=u.id, job_id=j.id)
+    realtime_hub.publish_from_sync("provider.status_changed", {"provider": provider_data(p)}, topic="providers", provider_id=p.id)
+    return payload
 @app.get("/jobs/{job_id}")
 def get_job(job_id:str,u:User=Depends(current_user),s:Session=Depends(db)):
     j=s.get(Job,job_id)
@@ -567,12 +843,19 @@ def cancel(job_id:str,u:User=Depends(current_user),s:Session=Depends(db)):
     j=s.get(Job,job_id)
     if not j or j.user_id!=u.id: raise HTTPException(404,"Job not found")
     refund_reservation(s,j,f"Refund for cancelled {j.name}")
-    j.status="CANCELLED";s.commit();return job_data(j,s)
+    j.status="CANCELLED";s.commit()
+    payload = job_data(j,s); wallet = wallet_for(s, u.id); s.commit()
+    realtime_hub.publish_from_sync("job.status_changed", {"job": payload}, topic="jobs", user_id=u.id, provider_id=j.provider_id, job_id=j.id)
+    realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, u.id), topic="billing", user_id=u.id, job_id=j.id)
+    return payload
 @app.post("/jobs/stop-all")
 def stop_all_jobs(u:User=Depends(current_user),s:Session=Depends(db)):
     jobs=s.query(Job).filter(Job.user_id==u.id,Job.status.in_(["QUEUED","SCHEDULED","RUNNING","RECOVERING"])).all()
     for j in jobs: j.status="CANCELLED";j.completed_at=datetime.now(timezone.utc)
-    s.commit();return {"cancelled":len(jobs)}
+    s.commit()
+    for j in jobs:
+        realtime_hub.publish_from_sync("job.status_changed", {"job": job_data(j,s)}, topic="jobs", user_id=u.id, provider_id=j.provider_id, job_id=j.id)
+    return {"cancelled":len(jobs)}
 @app.get("/providers/{provider_id}/jobs/pending")
 def pending(provider_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
     queued=[]
@@ -599,6 +882,7 @@ def update_job(job_id:str,body:Update,_=Depends(provider_auth),s:Session=Depends
             }
         )
 
+    previous_status = j.status
     if body.status: j.status=body.status.value
     if body.progress is not None: j.progress=body.progress
     if body.result is not None: j.result=body.result
@@ -620,7 +904,22 @@ def update_job(job_id:str,body:Update,_=Depends(provider_auth),s:Session=Depends
             token_ledger(s,wallet,"JOB_REFUND",reserved,"JOB",j.id,f"Reservation settlement for {j.name}",j.id)
             if actual: token_ledger(s,wallet,"JOB_USAGE",-actual,"JOB",j.id,f"Compute usage for {j.name}",j.id)
     s.commit()
-    return job_data(j,s)
+    payload = job_data(j,s)
+    if previous_status != j.status:
+        event_type = {
+            "FAILED": "job.failed",
+            "RECOVERING": "job.recovery_started",
+            "COMPLETED": "job.completed",
+        }.get(j.status, "job.status_changed")
+    else:
+        event_type = "job.progress"
+    realtime_hub.publish_from_sync(event_type, {"job": payload}, topic="jobs", user_id=j.user_id, provider_id=j.provider_id, job_id=j.id)
+    if j.status in ("COMPLETED", "FAILED", "CANCELLED"):
+        wallet = wallet_for(s, j.user_id); s.commit()
+        realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, j.user_id), topic="billing", user_id=j.user_id, job_id=j.id)
+        p = s.get(Provider, j.provider_id)
+        if p: realtime_hub.publish_from_sync("provider.status_changed", {"provider": provider_data(p)}, topic="providers", provider_id=p.id)
+    return payload
 
 @app.post("/providers/jobs/{job_id}/checkpoint")
 def checkpoint(job_id:str,body:dict,_=Depends(provider_auth),s:Session=Depends(db)):
@@ -668,13 +967,20 @@ def checkpoint(job_id:str,body:dict,_=Depends(provider_auth),s:Session=Depends(d
     s.add(c)
     j.progress = progress
     s.commit()
-    return {
+    checkpoint_data = {
         "id": c.id,
+        "job_id": j.id,
+        "job_name": j.name,
+        "provider_id": c.provider_id,
         "seq": c.seq,
         "attempt": c.attempt,
         "progress": c.progress,
-        "state_hash": c.state_hash
+        "state_hash": c.state_hash,
+        "created_at": c.payload.get("state", {}).get("recorded_at", c.created_at) if isinstance(c.payload, dict) else c.created_at,
     }
+    realtime_hub.publish_from_sync("checkpoint.saved", {"checkpoint": checkpoint_data}, topic="checkpoints", user_id=j.user_id, provider_id=j.provider_id, job_id=j.id)
+    realtime_hub.publish_from_sync("job.progress", {"job": job_data(j,s)}, topic="jobs", user_id=j.user_id, provider_id=j.provider_id, job_id=j.id)
+    return checkpoint_data
 
 @app.get("/providers/jobs/{job_id}/checkpoint/latest")
 def get_latest_checkpoint(job_id:str,_=Depends(provider_auth),s:Session=Depends(db)):
@@ -726,7 +1032,7 @@ def checkpoints(u:User=Depends(current_user),s:Session=Depends(db)):
 def dashboard(u:User=Depends(current_user),s:Session=Depends(db)):
     js=s.query(Job).filter_by(user_id=u.id).all();ps=s.query(Provider).all();n=max(len(ps),1)
     wallet=wallet_for(s,u.id);s.commit()
-    return {"active_jobs":sum(j.status in ("SCHEDULED","RUNNING","RECOVERING") for j in js),"available_nodes":sum(p.status in ("ONLINE","AVAILABLE") for p in ps),"token_balance":wallet.token_balance,"low_balance":wallet.token_balance<LOW_TOKEN_THRESHOLD,"gpu_utilization":round(sum(p.utilization.get("gpu",0) for p in ps)/n,1),"cpu_utilization":round(sum(p.utilization.get("cpu",0) for p in ps)/n,1),"ram_utilization":round(sum(p.utilization.get("ram",0) for p in ps)/n,1),"recent_jobs":[job_data(j,s) for j in sorted(js,key=lambda x:x.created_at,reverse=True)[:5]]}
+    return {"active_jobs":sum(j.status in ("SCHEDULED","RUNNING","RECOVERING") for j in js),"available_nodes":sum(p.status in ("ONLINE","AVAILABLE") for p in ps),"token_balance":wallet.token_balance,"low_balance":wallet.token_balance<LOW_TOKEN_THRESHOLD,"gpu_utilization":round(sum(p.utilization.get("gpu",0) for p in ps)/n,1),"cpu_utilization":round(sum(p.utilization.get("cpu",0) for p in ps)/n,1),"ram_utilization":round(sum(p.utilization.get("ram",0) for p in ps)/n,1),"disk_utilization":round(sum(p.utilization.get("disk",0) for p in ps)/n,1),"recent_jobs":[job_data(j,s) for j in sorted(js,key=lambda x:x.created_at,reverse=True)[:5]]}
 @app.get("/analytics")
 def analytics(u:User=Depends(current_user),s:Session=Depends(db)):
     js=s.query(Job).filter_by(user_id=u.id).all(); return {"job_success_rate":round(100*sum(j.status=="COMPLETED" for j in js)/max(sum(j.status in ("COMPLETED","FAILED") for j in js),1),1),"total_jobs":len(js),"recovery_count":sum(j.status=="RECOVERING" for j in js)}
@@ -743,7 +1049,9 @@ def purchase_tokens(body:TokenPurchase,u:User=Depends(current_user),s:Session=De
     package=next((x for x in TOKEN_PACKAGES if x["id"]==body.package_id),None)
     if not package: raise HTTPException(422,"Unknown token package")
     wallet=wallet_for(s,u.id);before=wallet.token_balance;after=token_ledger(s,wallet,"PURCHASE",package["tokens"],"PURCHASE",package["id"],f"Purchased {package['tokens']} tokens")
-    add_audit(s,"billing.token_purchase",user_id=u.id,details={"package":package["id"],"tokens":package["tokens"]});s.commit();return {"success":True,"tokens_added":package["tokens"],"previous_balance":before,"new_balance":after}
+    add_audit(s,"billing.token_purchase",user_id=u.id,details={"package":package["id"],"tokens":package["tokens"]});s.commit()
+    realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, u.id), topic="billing", user_id=u.id)
+    return {"success":True,"tokens_added":package["tokens"],"previous_balance":before,"new_balance":after}
 @app.post("/billing/demo-topup")
 def demo_topup(body:DemoTopUp,u:User=Depends(current_user),s:Session=Depends(db)):
     # College-project demo only: card data is validated for form completeness and never stored or transmitted.
@@ -753,6 +1061,7 @@ def demo_topup(body:DemoTopUp,u:User=Depends(current_user),s:Session=Depends(db)
     if not package: raise HTTPException(422,"Choose one of the configured demo packages: $10, $25, or $50")
     wallet=wallet_for(s,u.id);before=wallet.token_balance;after=token_ledger(s,wallet,"PURCHASE",package["tokens"],"PURCHASE",package["id"],f"Purchased {package['tokens']} tokens")
     add_audit(s,"billing.token_purchase",user_id=u.id,details={"package":package["id"],"tokens":package["tokens"]});s.commit()
+    realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, u.id), topic="billing", user_id=u.id)
     return {"wallet_balance":after,"credited":package["tokens"],"tokens_added":package["tokens"],"previous_balance":before,"card_last4":digits[-4:],"mode":"demo"}
 
 # ============================================================
@@ -996,6 +1305,18 @@ def stream_session_data(session: StreamSession, include_keys: bool = False, prov
         data["publish_key"] = session.publish_key
     return data
 
+def publish_stream_update(s: Session, session: StreamSession):
+    provider = s.get(Provider, session.provider_id) if session.provider_id else None
+    # Never fan out destination credentials or ingest publish keys. The owning
+    # user already receives the one-time key from the authenticated REST action.
+    realtime_hub.publish_from_sync(
+        "stream.updated",
+        {"session": stream_session_data(session, provider_name=provider.name if provider else None)},
+        topic="streams",
+        user_id=session.user_id,
+        provider_id=session.provider_id,
+    )
+
 @app.post("/stream/sessions")
 def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_user), s: Session = Depends(db)):
     active = s.query(StreamSession).filter(
@@ -1056,6 +1377,7 @@ def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_u
     add_audit(s, "stream.created", user_id=u.id, provider_id=p.id, details={"session_id": session_id, "profile": profile_key})
     s.commit()
     s.refresh(session)
+    publish_stream_update(s, session)
     return stream_session_data(session, include_keys=True, provider_name=p.name)
 
 @app.get("/stream/sessions/active")
@@ -1088,6 +1410,7 @@ def stop_stream_session(session_id: str, u: User = Depends(current_user), s: Ses
     session.status = "STOPPING"
     add_audit(s, "stream.stop_requested", user_id=u.id, provider_id=session.provider_id, details={"session_id": session_id})
     s.commit()
+    publish_stream_update(s, session)
     return stream_session_data(session)
 
 @app.post("/stream/internal/mediamtx/auth")
@@ -1112,6 +1435,7 @@ def mediamtx_auth(body: MediaMTXAuthPayload, s: Session = Depends(db)):
         if session.status == "ALLOCATED":
             session.status = "INGESTING"
             s.commit()
+            publish_stream_update(s, session)
         return {"status": "ok", "action": "publish"}
 
     elif body.action == "read":
@@ -1169,6 +1493,7 @@ def provider_stream_heartbeat(session_id: str, body: StreamHeartbeatPayload, _ =
     wallet = wallet_for(s, sess.user_id)
     last_bill = sess.last_billed_at if (sess.last_billed_at and sess.last_billed_at.tzinfo) else (sess.last_billed_at.replace(tzinfo=timezone.utc) if sess.last_billed_at else now)
     elapsed_since_bill = (now - last_bill).total_seconds()
+    balance_changed = False
 
     if elapsed_since_bill >= 60:
         minutes_to_bill = int(elapsed_since_bill // 60)
@@ -1182,14 +1507,20 @@ def provider_stream_heartbeat(session_id: str, body: StreamHeartbeatPayload, _ =
             sess.status = "STOPPING"
             sess.error_message = "Budget exhausted: insufficient tokens"
             s.commit()
+            publish_stream_update(s, sess)
+            realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, sess.user_id), topic="billing", user_id=sess.user_id)
             return {"action": "stop", "reason": "insufficient_tokens"}
         else:
             token_ledger(s, wallet, "STREAM_USAGE", -tokens_due, "STREAM", sess.id, f"Stream compute minute for {sess.id}", sess.id)
             sess.total_tokens_billed += tokens_due
             sess.last_billed_at = now
+            balance_changed = True
             s.commit()
 
     s.commit()
+    publish_stream_update(s, sess)
+    if balance_changed:
+        realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, sess.user_id), topic="billing", user_id=sess.user_id)
     return {"action": "continue", "token_balance": wallet.token_balance}
 
 @app.post("/providers/streams/{session_id}/stopped")
@@ -1220,5 +1551,8 @@ def provider_stream_stopped(session_id: str, body: StreamHeartbeatPayload, _ = D
         "error": sess.error_message
     })
     s.commit()
+    publish_stream_update(s, sess)
+    if p:
+        realtime_hub.publish_from_sync("provider.status_changed", {"provider": provider_data(p)}, topic="providers", provider_id=p.id)
     return {"ok": True, "status": sess.status}
 

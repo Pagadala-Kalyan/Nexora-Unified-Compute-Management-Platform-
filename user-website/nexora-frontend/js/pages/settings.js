@@ -21,37 +21,37 @@ export function renderSettingsPage() {
       id: 'quantum-neon',
       name: 'Palette A — Quantum Neon',
       desc: 'Deep black & graphite with electric cyan & vivid violet accents.',
-      bg: '#07090F',
-      surface: '#111827',
-      cyan: '#00E5FF',
-      violet: '#8B5CF6'
+      bg: '#090810',
+      surface: '#191626',
+      cyan: '#8B64FF',
+      violet: '#6652D9'
     },
     {
       id: 'cyberpunk-obsidian',
       name: 'Palette B — Cyberpunk Obsidian',
       desc: 'Obsidian black with neon turquoise & hot magenta.',
-      bg: '#050505',
-      surface: '#17171E',
-      cyan: '#00FFD1',
-      violet: '#FF36D1'
+      bg: '#090810',
+      surface: '#221D32',
+      cyan: '#8B64FF',
+      violet: '#A78BFA'
     },
     {
       id: 'deep-space-blue',
       name: 'Palette C — Deep Space Blue',
       desc: 'Navy space aesthetic inspired by cloud orchestration planes.',
-      bg: '#050B18',
-      surface: '#101E35',
-      cyan: '#35E0E8',
-      violet: '#4DA3FF'
+      bg: '#090810',
+      surface: '#2B2440',
+      cyan: '#6652D9',
+      violet: '#C4B5FD'
     },
     {
       id: 'arctic-light',
       name: 'Palette D — Arctic Light',
       desc: 'Crisp, high-contrast light mode for bright environments.',
-      bg: '#F4F7FB',
-      surface: '#FFFFFF',
-      cyan: '#087EA4',
-      violet: '#7057E8'
+      bg: '#090810',
+      surface: '#34284D',
+      cyan: '#8B64FF',
+      violet: '#A78BFA'
     }
   ];
 
@@ -62,7 +62,7 @@ export function renderSettingsPage() {
         <div>
           <h2>System Settings & Preferences</h2>
           <p style="font-size: var(--text-xs); color: var(--text-muted);">
-            Visual identity, interface polling rate, and active session management.
+            Visual preferences, disconnected-state reconciliation, and active session management.
           </p>
         </div>
       </div>
@@ -110,21 +110,20 @@ export function renderSettingsPage() {
           `}
         </div>
 
-        <!-- Section 2: Polling & Network Configuration -->
+        <!-- Section 2: Reconciliation & Network Configuration -->
         <div class="card">
           <div class="card-header">
             <div>
-              <div class="card-title">${getIcon('refresh')} Telemetry Polling Cadence</div>
-              <div class="card-subtitle">Frequency of background heartbeat & status refreshes</div>
+              <div class="card-title">${getIcon('refresh')} Reconnect Reconciliation</div>
+              <div class="card-subtitle">Live updates use one WebSocket; REST reconciles only while disconnected.</div>
             </div>
           </div>
 
           <div class="form-group">
-            <label class="form-label" for="polling-cadence-select">Live Telemetry Interval</label>
+            <label class="form-label" for="polling-cadence-select">Disconnected refresh interval</label>
             <select id="polling-cadence-select" class="select">
-              <option value="2000" ${currentCadence === 2000 ? 'selected' : ''}>2 Seconds (Real-time)</option>
-              <option value="4000" ${currentCadence === 4000 ? 'selected' : ''}>4 Seconds (Recommended)</option>
-              <option value="8000" ${currentCadence === 8000 ? 'selected' : ''}>8 Seconds (Conserve Network)</option>
+              <option value="15000" ${currentCadence === 15000 ? 'selected' : ''}>15 Seconds (Recommended)</option>
+              <option value="30000" ${currentCadence === 30000 ? 'selected' : ''}>30 Seconds (Conserve Network)</option>
               <option value="0" ${currentCadence === 0 ? 'selected' : ''}>Manual Refresh Only (Paused)</option>
             </select>
           </div>
@@ -155,10 +154,10 @@ export function renderSettingsPage() {
             return `
               <div class="theme-preview-card ${isActive ? 'active' : ''}" data-theme-target="${t.id}" style="background: ${t.surface};">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
-                  <span style="font-size: var(--text-sm); font-weight: 700; color: ${t.id === 'arctic-light' ? '#172033' : '#F4F7FF'};">${t.name}</span>
+                  <span style="font-size: var(--text-sm); font-weight: 700; color: #F5F3FF;">${t.name}</span>
                   ${isActive ? `<span style="font-size: 11px; color: ${t.cyan}; font-weight: 700; font-family: var(--font-mono);">ACTIVE</span>` : ''}
                 </div>
-                <p style="font-size: var(--text-2xs); color: ${t.id === 'arctic-light' ? '#58677D' : '#A2AEC4'};">${t.desc}</p>
+                <p style="font-size: var(--text-2xs); color: #C0B9D2;">${t.desc}</p>
                 <div class="palette-dots-row">
                   <span class="palette-dot" style="background: ${t.bg}; border: 1px solid rgba(255,255,255,0.2);"></span>
                   <span class="palette-dot" style="background: ${t.surface}; border: 1px solid rgba(255,255,255,0.2);"></span>
@@ -204,7 +203,7 @@ export function initSettingsEvents() {
     cadenceSelect.addEventListener('change', (e) => {
       const ms = Number(e.target.value);
       setPollingCadence(ms);
-      showToast(ms > 0 ? `Telemetry interval set to ${ms / 1000}s` : 'Polling paused', 'info');
+      showToast(ms > 0 ? `Disconnected-state reconciliation set to ${ms / 1000}s` : 'Automatic reconciliation paused', 'info');
     });
   }
 

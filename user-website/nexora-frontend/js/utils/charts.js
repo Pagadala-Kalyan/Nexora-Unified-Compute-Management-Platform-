@@ -18,46 +18,118 @@ export function renderSplineAreaChart(dataPoints = [], options = {}) {
   const chartW = width - paddingLeft - paddingRight;
   const chartH = height - paddingTop - paddingBottom;
 
-  // Default curve points if empty
-  const pts = (dataPoints && dataPoints.length > 1) ? dataPoints : [42, 58, 76, 91, 84, 69, 58, 88, 72, 64];
   const maxVal = 100;
   const minVal = 0;
-
-  // Calculate normalized coordinates
-  const coords = pts.map((val, idx) => {
-    const x = paddingLeft + (idx / (pts.length - 1)) * chartW;
-    const y = paddingTop + chartH - ((Math.min(100, Math.max(0, val)) - minVal) / (maxVal - minVal)) * chartH;
-    return { x, y, val };
+  let raw = (dataPoints || []).map(value => {
+    const number = value == null || value === '' ? null : Number(value);
+    return Number.isFinite(number) ? Math.max(minVal, Math.min(maxVal, number)) : null;
   });
+  let labels = options.labels || [];
+  let timestamps = options.timestamps || labels;
+  const parsedTimestamps = raw.map((_, index) => new Date(timestamps[index]).getTime());
+  if (raw.length > 1 && parsedTimestamps.every(Number.isFinite)) {
+    // Keep each value attached to its own timestamp. Duplicate instants are
+    // one sample; retaining both would create a zero-width vertical segment.
+    const ordered = raw.map((value, index) => ({
+      value,
+      label: labels[index] || '',
+      timestamp: timestamps[index],
+      epoch: parsedTimestamps[index],
+      index
+    })).sort((a, b) => a.epoch - b.epoch || a.index - b.index);
+    const unique = [];
+    for (const sample of ordered) {
+      if (unique.length && unique[unique.length - 1].epoch === sample.epoch) unique[unique.length - 1] = sample;
+      else unique.push(sample);
+    }
+    raw = unique.map(sample => sample.value);
+    labels = unique.map(sample => sample.label);
+    timestamps = unique.map(sample => sample.timestamp);
+  }
+  const epochTimes = timestamps.map(value => {
+    const epoch = value ? new Date(value).getTime() : NaN;
+    return Number.isFinite(epoch) ? epoch : null;
+  });
+  const validEpochs = epochTimes.filter(value => value != null);
+  const useTimeScale = validEpochs.length === raw.length && validEpochs.length > 1 && validEpochs.at(-1) > validEpochs[0];
+  const points = raw.map((value, idx) => ({
+    x: paddingLeft + (raw.length <= 1
+      ? chartW
+      : useTimeScale
+        ? ((epochTimes[idx] - validEpochs[0]) / (validEpochs.at(-1) - validEpochs[0])) * chartW
+        : (idx / (raw.length - 1)) * chartW),
+    y: value == null ? null : paddingTop + chartH - ((value - minVal) / (maxVal - minVal)) * chartH,
+    val: value,
+    label: timestamps[idx]
+      ? new Date(timestamps[idx]).toLocaleString([], { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      : (labels[idx] || '')
+  }));
 
-  // Generate cubic spline path
-  function createSplinePath(points) {
-    if (points.length < 2) return '';
-    let d = `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
-    for (let i = 0; i < points.length - 1; i++) {
-      const p0 = points[i === 0 ? 0 : i - 1];
-      const p1 = points[i];
-      const p2 = points[i + 1];
-      const p3 = points[i + 2] || p2;
-
-      const cp1x = p1.x + (p2.x - p0.x) / 6;
-      const cp1y = p1.y + (p2.y - p0.y) / 6;
-      const cp2x = p2.x - (p3.x - p1.x) / 6;
-      const cp2y = p2.y - (p3.y - p1.y) / 6;
-
-      d += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+  // Fritsch-Carlson monotone cubic interpolation. Its control points remain
+  // inside each adjacent sample interval, so the curve cannot invent peaks.
+  function monotonePath(segment) {
+    if (!segment.length) return '';
+    let d = `M ${segment[0].x.toFixed(2)},${segment[0].y.toFixed(2)}`;
+    if (segment.length === 1) return d;
+    const widths = segment.slice(0, -1).map((point, i) => segment[i + 1].x - point.x);
+    const slopes = segment.slice(0, -1).map((point, i) => (segment[i + 1].y - point.y) / widths[i]);
+    const tangents = new Array(segment.length);
+    tangents[0] = slopes[0];
+    tangents[tangents.length - 1] = slopes[slopes.length - 1];
+    for (let i = 1; i < segment.length - 1; i++) {
+      const before = slopes[i - 1];
+      const after = slopes[i];
+      if (before * after <= 0) tangents[i] = 0;
+      else {
+        const beforeWidth = widths[i - 1];
+        const afterWidth = widths[i];
+        const w1 = 2 * afterWidth + beforeWidth;
+        const w2 = afterWidth + 2 * beforeWidth;
+        tangents[i] = (w1 + w2) / (w1 / before + w2 / after);
+      }
+    }
+    for (let i = 0; i < slopes.length; i++) {
+      const slope = slopes[i];
+      if (slope === 0) {
+        tangents[i] = 0;
+        tangents[i + 1] = 0;
+        continue;
+      }
+      const alpha = tangents[i] / slope;
+      const beta = tangents[i + 1] / slope;
+      const magnitude = alpha * alpha + beta * beta;
+      if (magnitude > 9) {
+        const scale = 3 / Math.sqrt(magnitude);
+        tangents[i] = scale * alpha * slope;
+        tangents[i + 1] = scale * beta * slope;
+      }
+    }
+    for (let i = 0; i < segment.length - 1; i++) {
+      const p = segment[i];
+      const q = segment[i + 1];
+      const dx = q.x - p.x;
+      const cp1y = p.y + tangents[i] * dx / 3;
+      const cp2y = q.y - tangents[i + 1] * dx / 3;
+      d += ` C ${(p.x + dx / 3).toFixed(2)},${cp1y.toFixed(2)} ${(q.x - dx / 3).toFixed(2)},${cp2y.toFixed(2)} ${q.x.toFixed(2)},${q.y.toFixed(2)}`;
     }
     return d;
   }
 
-  const linePath = createSplinePath(coords);
-  const areaPath = `${linePath} L ${(paddingLeft + chartW).toFixed(1)},${(paddingTop + chartH).toFixed(1)} L ${paddingLeft.toFixed(1)},${(paddingTop + chartH).toFixed(1)} Z`;
-
-  // Locate apex point for rapt.ai highlight probe
-  let maxPt = coords[0];
-  for (const c of coords) {
-    if (c.val > maxPt.val) maxPt = c;
-  }
+  const segments = [];
+  let segment = [];
+  points.forEach(point => {
+    if (point.val == null) {
+      if (segment.length) segments.push(segment);
+      segment = [];
+    } else segment.push(point);
+  });
+  if (segment.length) segments.push(segment);
+  const linePath = segments.map(monotonePath).join(' ');
+  const baselineY = paddingTop + chartH;
+  const areaPaths = segments.map(group => {
+    if (group.length < 2) return '';
+    return `${monotonePath(group)} L ${group[group.length - 1].x.toFixed(2)},${baselineY.toFixed(2)} L ${group[0].x.toFixed(2)},${baselineY.toFixed(2)} Z`;
+  }).join(' ');
 
   // Gridlines
   const gridSteps = [0, 25, 50, 75, 100];
@@ -72,24 +144,45 @@ export function renderSplineAreaChart(dataPoints = [], options = {}) {
   }).join('');
 
   // Timeline labels
-  const timelineLabels = options.labels || ['00:00', '03:00', '06:00', '09:00', '12:00', '15:00', '18:00', '21:00', 'NOW'];
-  const timelineTicks = timelineLabels.map((lbl, i) => {
-    const x = paddingLeft + (i / (timelineLabels.length - 1)) * chartW;
+  const tickIndexes = [];
+  if (raw.length) {
+    const minimumTickSpacing = 48;
+    for (const fraction of [0, 0.25, 0.5, 0.75, 1]) {
+      const targetX = paddingLeft + chartW * fraction;
+      let nearestIndex = 0;
+      for (let index = 1; index < points.length; index++) {
+        if (Math.abs(points[index].x - targetX) < Math.abs(points[nearestIndex].x - targetX)) nearestIndex = index;
+      }
+      if (tickIndexes.every(index => Math.abs(points[index].x - points[nearestIndex].x) >= minimumTickSpacing)) {
+        tickIndexes.push(nearestIndex);
+      }
+    }
+  }
+  const timelineTicks = tickIndexes.map(i => {
+    const lbl = labels[i] || '';
+    const x = points[i].x;
     return `
-      <text x="${x}" y="${height - 8}" fill="var(--text-muted)" font-size="9" font-family="var(--font-mono)" text-anchor="middle">${lbl}</text>
+      <text class="telemetry-axis-tick" x="${x}" y="${height - 8}" fill="var(--text-muted)" font-size="9" font-family="var(--font-mono)" text-anchor="middle">${escapeChartText(lbl)}</text>
     `;
   }).join('');
 
-  const strokeColor = options.strokeColor || '#7566F6';
-  const gradId = options.gradId || 'splineGrad_' + Math.random().toString(36).substr(2, 6);
+  const strokeColor = options.strokeColor || '#8B64FF';
+  const gradId = options.gradId || 'splineGrad_telemetry';
+  const pointMarkup = points.filter(point => point.val != null).map(point => `
+    <g class="telemetry-chart-point" tabindex="0" role="img" aria-label="${escapeChartText(point.label)}: ${point.val.toFixed(1)} percent">
+      <title>${escapeChartText(point.label)} · ${point.val.toFixed(1)}%</title>
+      <circle class="telemetry-chart-hit" cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="8" />
+      <circle class="telemetry-chart-highlight" cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="3.2" />
+    </g>`).join('');
+  const hasData = points.some(point => point.val != null);
 
   return `
-    <svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="overflow: visible;">
+    <svg xmlns="http://www.w3.org/2000/svg" class="telemetry-chart-svg" width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Telemetry history chart">
       <defs>
         <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="${strokeColor}" stop-opacity="0.32"/>
-          <stop offset="60%" stop-color="#13D9F2" stop-opacity="0.08"/>
-          <stop offset="100%" stop-color="#080B12" stop-opacity="0"/>
+          <stop offset="60%" stop-color="#6652D9" stop-opacity="0.10"/>
+          <stop offset="100%" stop-color="#090810" stop-opacity="0"/>
         </linearGradient>
       </defs>
 
@@ -100,16 +193,69 @@ export function renderSplineAreaChart(dataPoints = [], options = {}) {
       ${timelineTicks}
 
       <!-- Area Fill -->
-      <path d="${areaPath}" fill="url(#${gradId})" />
+      <path class="telemetry-chart-area" d="${areaPaths}" fill="url(#${gradId})" />
 
-      <!-- Spline Line -->
-      <path d="${linePath}" fill="none" stroke="${strokeColor}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+      <path class="telemetry-chart-line" d="${linePath}" fill="none" stroke="${strokeColor}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
 
-      <!-- Active Apex Probe (rapt.ai indicator) -->
-      <circle cx="${maxPt.x}" cy="${maxPt.y}" r="6" fill="#F06478" opacity="0.25" class="pulse-ring"/>
-      <circle cx="${maxPt.x}" cy="${maxPt.y}" r="3.5" fill="#FFFFFF" stroke="#F06478" stroke-width="2"/>
+      <g class="telemetry-chart-points">${pointMarkup}</g>
+      ${hasData ? '' : `<text class="telemetry-chart-empty" x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="var(--text-muted)" font-size="12">Waiting for provider telemetry…</text>`}
     </svg>
   `;
+}
+
+function escapeChartText(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+}
+
+/** Patch the existing SVG when a live sample arrives, keeping its axes and DOM stable. */
+export function updateSplineAreaChart(container, dataPoints = [], options = {}) {
+  if (!container) return;
+  const markup = renderSplineAreaChart(dataPoints, options);
+  const charts = [...container.querySelectorAll('.telemetry-chart-svg')];
+  const current = charts[0];
+  if (!current) {
+    container.innerHTML = markup;
+    return;
+  }
+  charts.slice(1).forEach(chart => chart.remove());
+  const next = new DOMParser().parseFromString(markup, 'image/svg+xml').documentElement;
+  for (const selector of ['.telemetry-chart-area', '.telemetry-chart-line', '.telemetry-chart-points', '.telemetry-chart-empty']) {
+    const oldNode = current.querySelector(selector);
+    const newNode = next.querySelector(selector);
+    if (oldNode && newNode) {
+      if (selector === '.telemetry-chart-points') {
+        const oldPoints = [...oldNode.children];
+        const newPoints = [...newNode.children];
+        newPoints.forEach((point, index) => {
+          const existing = oldPoints[index];
+          if (existing) {
+            existing.setAttribute('aria-label', point.getAttribute('aria-label'));
+            existing.querySelector('title').textContent = point.querySelector('title').textContent;
+            existing.querySelector('.telemetry-chart-hit').setAttribute('cx', point.querySelector('.telemetry-chart-hit').getAttribute('cx'));
+            existing.querySelector('.telemetry-chart-hit').setAttribute('cy', point.querySelector('.telemetry-chart-hit').getAttribute('cy'));
+            existing.querySelector('.telemetry-chart-highlight').setAttribute('cx', point.querySelector('.telemetry-chart-highlight').getAttribute('cx'));
+            existing.querySelector('.telemetry-chart-highlight').setAttribute('cy', point.querySelector('.telemetry-chart-highlight').getAttribute('cy'));
+          } else oldNode.append(point.cloneNode(true));
+        });
+        while (oldNode.children.length > newPoints.length) oldNode.lastElementChild.remove();
+      } else oldNode.setAttribute('d', newNode.getAttribute('d') || '');
+    } else if (!oldNode && newNode) current.append(newNode.cloneNode(true));
+    else if (oldNode && !newNode) oldNode.remove();
+  }
+  const oldTicks = [...current.querySelectorAll('.telemetry-axis-tick')];
+  const newTicks = [...next.querySelectorAll('.telemetry-axis-tick')];
+  newTicks.forEach((tick, index) => {
+    if (oldTicks[index]) {
+      oldTicks[index].textContent = tick.textContent;
+      oldTicks[index].setAttribute('x', tick.getAttribute('x'));
+    } else current.append(tick.cloneNode(true));
+  });
+  while (oldTicks.length > newTicks.length) oldTicks.pop().remove();
+  container.classList.remove('telemetry-updating');
+  requestAnimationFrame(() => {
+    container.classList.add('telemetry-updating');
+    setTimeout(() => container.classList.remove('telemetry-updating'), 180);
+  });
 }
 
 /**

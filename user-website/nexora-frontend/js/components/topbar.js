@@ -27,10 +27,10 @@ export function renderTopbar(currentRoute = 'overview') {
   const balance = state.dashboard?.token_balance ?? state.user?.token_balance ?? 0;
 
   const themes = [
-    { id: 'quantum-neon', label: 'Quantum Neon', dot: '#13D9F2' },
-    { id: 'cyberpunk-obsidian', label: 'Cyberpunk Obsidian', dot: '#00FFD1' },
-    { id: 'deep-space-blue', label: 'Deep Space Blue', dot: '#4DA3FF' },
-    { id: 'arctic-light', label: 'Arctic Light', dot: '#087EA4' }
+    { id: 'quantum-neon', label: 'Quantum Neon', dot: '#8B64FF' },
+    { id: 'cyberpunk-obsidian', label: 'Cyberpunk Obsidian', dot: '#6652D9' },
+    { id: 'deep-space-blue', label: 'Deep Space Blue', dot: '#A78BFA' },
+    { id: 'arctic-light', label: 'Arctic Light', dot: '#51416F' }
   ];
 
   return `
@@ -67,6 +67,10 @@ export function renderTopbar(currentRoute = 'overview') {
         <div class="cluster-health-pill" title="Control-plane latency: ${health.latencyMs}ms">
           <span class="health-dot ${health.status}"></span>
           <span class="health-label">${health.status === 'online' ? `Online · ${health.latencyMs}ms` : health.status.toUpperCase()}</span>
+        </div>
+
+        <div id="realtime-status-pill" class="realtime-status-pill ${state.realtime.status === 'connected' ? 'connected' : 'stale'}" title="${state.realtime.status === 'connected' ? 'Connected to live event stream' : 'Waiting for live updates'}">
+          ${state.realtime.status === 'connected' ? 'Live updates' : ['connecting', 'syncing'].includes(state.realtime.status) ? 'Syncing…' : 'Reconnecting · data may be stale'}
         </div>
 
         <!-- Token Balance Pill -->
