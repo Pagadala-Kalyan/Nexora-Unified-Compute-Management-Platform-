@@ -20,11 +20,13 @@ services:
       - key: CORS_ORIGIN_REGEX
         value: https://.*\.vercel\.app
       - key: MEDIAMTX_INGEST_URL
-        sync: false
+        value: rtmp://127.0.0.1:1935
       - key: MEDIAMTX_PROVIDER_READ_URL
-        sync: false
+        value: rtsp://127.0.0.1:8554
+      - key: MEDIAMTX_WEBRTC_URL
+        value: http://127.0.0.1:8889
       - key: MEDIA_SERVER_ALLOW_LOOPBACK
-        value: "false"
+        value: "true"
 
 databases:
   - name: nexora-db

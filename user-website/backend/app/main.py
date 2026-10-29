@@ -1393,10 +1393,10 @@ async def provider_upload_artifact(job_id: str, file: UploadFile = File(...), ar
 # REMOTE STREAM ENCODING ENDPOINTS
 # ============================================================
 
-MEDIAMTX_INGEST_URL = os.getenv("MEDIAMTX_INGEST_URL", "").strip().rstrip("/")
-MEDIAMTX_PROVIDER_READ_URL = os.getenv("MEDIAMTX_PROVIDER_READ_URL", os.getenv("MEDIAMTX_INTERNAL_URL", "")).strip().rstrip("/")
-MEDIAMTX_WEBRTC_URL = os.getenv("MEDIAMTX_WEBRTC_URL", "http://127.0.0.1:8889").strip().rstrip("/")
-MEDIA_SERVER_ALLOW_LOOPBACK = os.getenv("MEDIA_SERVER_ALLOW_LOOPBACK", "false").lower() in ("1", "true", "yes")
+MEDIAMTX_INGEST_URL = (os.getenv("MEDIAMTX_INGEST_URL") or "rtmp://127.0.0.1:1935").strip().rstrip("/")
+MEDIAMTX_PROVIDER_READ_URL = (os.getenv("MEDIAMTX_PROVIDER_READ_URL") or os.getenv("MEDIAMTX_INTERNAL_URL") or "rtsp://127.0.0.1:8554").strip().rstrip("/")
+MEDIAMTX_WEBRTC_URL = (os.getenv("MEDIAMTX_WEBRTC_URL") or "http://127.0.0.1:8889").strip().rstrip("/")
+MEDIA_SERVER_ALLOW_LOOPBACK = os.getenv("MEDIA_SERVER_ALLOW_LOOPBACK", "true").lower() in ("1", "true", "yes")
 STREAM_ACTIVE_STATUSES = ("CREATED", "ALLOCATED", "STARTING", "WAITING_FOR_INPUT", "INGESTING", "RECEIVING", "ENCODING", "STREAMING", "STOPPING")
 STREAM_TERMINAL_STATUSES = ("STOPPED", "COMPLETED", "FAILED")
 
