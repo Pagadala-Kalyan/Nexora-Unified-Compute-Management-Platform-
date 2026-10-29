@@ -27,6 +27,162 @@ export async function requestBrowserCapture(mediaDevices = globalThis.navigator?
   }
 }
 
+export async function requestCameraCapture(mediaDevices = globalThis.navigator?.mediaDevices) {
+  if (!mediaDevices || typeof mediaDevices.getUserMedia !== 'function') {
+    throw new Error('Camera capture is not supported by this browser. Use a current Chrome, Edge, or Firefox browser over HTTPS or localhost.');
+  }
+
+  try {
+    const stream = await mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: true
+    });
+    if (!stream?.getVideoTracks?.().length) {
+      stopMediaStream(stream);
+      throw new Error('The selected camera did not provide a video track. Check camera permissions.');
+    }
+    return stream;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('The selected camera')) throw error;
+    if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
+      throw new Error('Camera access permission was denied. Allow camera permissions in your browser and try again.');
+    }
+    if (error?.name === 'NotFoundError' || error?.name === 'DevicesNotFoundError') {
+      throw new Error('No camera or webcam was found on this device.');
+    }
+    throw new Error(`Could not access camera: ${error.message || 'Check camera permissions and try again.'}`);
+  }
+}
+
+export function createSimulatedMediaStream() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1280;
+  canvas.height = 720;
+  const ctx = canvas.getContext('2d');
+  
+  let frame = 0;
+  let animId = null;
+
+  function draw() {
+    frame++;
+    const now = new Date();
+    
+    // Gradient futuristic background
+    const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+    grad.addColorStop(0, '#0a0d18');
+    grad.addColorStop(0.5, '#121829');
+    grad.addColorStop(1, '#070912');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(74, 222, 128, 0.08)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < canvas.width; x += 40) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = 0; y < canvas.height; y += 40) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+
+    // Animated rotating radar circle
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    const angle = (frame * 0.03) % (Math.PI * 2);
+    ctx.strokeStyle = '#00f0ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 120, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(angle) * 120, cy + Math.sin(angle) * 120);
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.8)';
+    ctx.stroke();
+
+    // Pulse center dot
+    const pulse = Math.sin(frame * 0.1) * 6 + 12;
+    ctx.fillStyle = '#ff0055';
+    ctx.beginPath();
+    ctx.arc(cx, cy, pulse, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Header badge
+    ctx.fillStyle = '#00f0ff';
+    ctx.font = 'bold 28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('NEXORA BROADCAST ENGINE', cx, 100);
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+    ctx.font = '16px monospace';
+    ctx.fillText('LIVE SIMULATED INPUT • 720p60 • WEBRTC WHIP TEST', cx, 135);
+
+    // Timecode & Frame counter
+    const timecode = now.toISOString().replace('T', ' ').slice(0, 23);
+    ctx.fillStyle = '#39d353';
+    ctx.font = 'bold 36px monospace';
+    ctx.fillText(timecode, cx, 540);
+
+    ctx.fillStyle = '#a78bfa';
+    ctx.font = '18px monospace';
+    ctx.fillText(`FRAME: ${frame} | FPS: 60 | AUDIO: SYNTH OSCILLATOR`, cx, 580);
+
+    // Waveform at bottom
+    ctx.strokeStyle = '#00f0ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < canvas.width; i += 10) {
+      const h = Math.sin((i + frame * 5) * 0.05) * 20;
+      if (i === 0) ctx.moveTo(i, 650 + h);
+      else ctx.lineTo(i, 650 + h);
+    }
+    ctx.stroke();
+
+    animId = requestAnimationFrame(draw);
+  }
+
+  draw();
+
+  const stream = canvas.captureStream ? canvas.captureStream(30) : null;
+  if (!stream) {
+    throw new Error('Canvas captureStream is not supported in this environment.');
+  }
+
+  try {
+    const AudioCtx = globalThis.AudioContext || globalThis.webkitAudioContext;
+    if (AudioCtx) {
+      const audioCtx = new AudioCtx();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      gain.gain.value = 0.01;
+      osc.frequency.value = 440;
+      const dest = audioCtx.createMediaStreamDestination();
+      osc.connect(gain);
+      gain.connect(dest);
+      osc.start();
+      const audioTrack = dest.stream?.getAudioTracks?.()[0];
+      if (audioTrack) {
+        stream.addTrack(audioTrack);
+        audioTrack.addEventListener('ended', () => {
+          try { osc.stop(); audioCtx.close(); } catch (_) {}
+        });
+      }
+    }
+  } catch (_) {}
+
+  const videoTrack = stream.getVideoTracks()[0];
+  if (videoTrack) {
+    const origStop = videoTrack.stop.bind(videoTrack);
+    videoTrack.stop = () => {
+      if (animId) cancelAnimationFrame(animId);
+      origStop();
+    };
+  }
+
+  return stream;
+}
+
 export function stopMediaStream(stream) {
   for (const track of stream?.getTracks?.() || []) {
     track.onended = null;

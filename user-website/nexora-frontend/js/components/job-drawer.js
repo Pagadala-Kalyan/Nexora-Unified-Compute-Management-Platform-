@@ -10,6 +10,10 @@ import { showToast } from './toast.js';
 import { getStatusBadgeHTML, formatDate, formatDuration, formatNumber, formatBytes, copyToClipboard } from '../utils/formatters.js';
 import { getIcon } from '../utils/icons.js';
 
+function escapeMarkup(str) {
+  return String(str ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
 export function openJobDrawer(jobId) {
   let drawerWrap = document.getElementById('job-drawer-wrap');
   if (!drawerWrap) {
@@ -172,6 +176,12 @@ export function openJobDrawer(jobId) {
           <div style="font-size: var(--text-xs); font-weight: 700; color: var(--text-muted); text-transform: uppercase; margin-bottom: var(--space-2);">
             Workload Result & Artifacts
           </div>
+          ${job.workload === 'custom_python' && job.result?.output ? `
+            <div style="margin-bottom: var(--space-3);">
+              <div style="font-size: var(--text-2xs); color: var(--accent-cyan); font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">Standard Output (stdout)</div>
+              <pre style="background: #0d1117; border: 1px solid rgba(56, 189, 248, 0.25); border-radius: var(--radius-md); padding: var(--space-3); font-size: 12px; font-family: var(--font-mono); color: #39d353; overflow-x: auto; max-height: 220px; white-space: pre-wrap; line-height: 1.45;">${escapeMarkup(job.result.output)}</pre>
+            </div>
+          ` : ''}
           <pre style="background: var(--bg-app); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: var(--space-3); font-size: var(--text-xs); color: var(--accent-cyan-bright); overflow-x: auto; max-height: 220px; white-space: pre-wrap;">${job.result ? JSON.stringify(job.result, null, 2) : '// Awaiting workload completion...'}</pre>
         </div>
       </div>

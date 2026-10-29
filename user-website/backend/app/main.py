@@ -1469,10 +1469,10 @@ def stream_session_data(session: StreamSession, include_keys: bool = False, prov
         "ingest_path": f"live/{session.id}",
         "source_mode": (session.encoding_config or {}).get("source_mode", "obs"),
     }
-    if data["source_mode"] == "browser_capture":
+    if data["source_mode"] in ("browser_capture", "browser_camera", "browser_simulation"):
         data["webrtc_publish_url"] = f"{MEDIAMTX_WEBRTC_URL}/{session.ingest_path}/whip" if MEDIAMTX_WEBRTC_URL else None
     if include_keys:
-        if data["source_mode"] == "browser_capture":
+        if data["source_mode"] in ("browser_capture", "browser_camera", "browser_simulation"):
             # WHIP carries session credentials in Basic auth, never the URL.
             data["browser_publish_credential"] = {"username": "nexora", "password": session.publish_key}
         else:
@@ -1495,9 +1495,9 @@ def publish_stream_update(s: Session, session: StreamSession):
 @app.post("/stream/sessions")
 def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_user), s: Session = Depends(db)):
     _validate_media_server_config()
-    if body.source_mode not in ("obs", "browser_capture"):
-        raise HTTPException(422, "Choose OBS or Browser Capture as the stream input")
-    if body.source_mode == "browser_capture":
+    if body.source_mode not in ("obs", "browser_capture", "browser_camera", "browser_simulation"):
+        raise HTTPException(422, "Choose OBS, Browser Screen, Camera, or Simulation as the stream input")
+    if body.source_mode in ("browser_capture", "browser_camera", "browser_simulation"):
         _validate_webrtc_publish_url()
     if body.destination_platform not in ("youtube", "twitch", "custom_rtmp"):
         raise HTTPException(422, "Choose a supported stream destination platform")

@@ -1794,12 +1794,14 @@ def execute(job):
                 ) as submitted:
                     submitted.write(code)
 
+                stdin_input = job["requirements"].get("stdin_input") or ""
                 process = subprocess.run(
                     [
                         sys.executable,
                         "-I",
                         source
                     ],
+                    input=stdin_input if stdin_input else None,
                     capture_output=True,
                     text=True,
                     timeout=int(
@@ -1988,7 +1990,14 @@ if __name__ == "__main__":
     parser.add_argument("--local", action="store_true", help="Connect to localhost control plane (127.0.0.1:8000)")
     parser.add_argument("--url", type=str, default=None, help="Custom control plane URL")
     parser.add_argument("--token", type=str, default=None, help="Provider shared secret token")
+    parser.add_argument("--id", type=str, default=None, help="Custom provider ID (for secondary/recovery nodes)")
+    parser.add_argument("--name", type=str, default=None, help="Custom provider display name")
     args, _ = parser.parse_known_args()
+
+    if args.id:
+        PID = args.id.strip()
+    if args.name:
+        NAME = args.name.strip()
 
     if args.token:
         TOKEN = args.token

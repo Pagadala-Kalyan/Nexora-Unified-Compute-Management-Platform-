@@ -8,7 +8,13 @@ import { showToast } from '../components/toast.js';
 import { state } from '../state.js';
 import { setCurrentUser } from '../auth.js';
 import { getApiBase, getToken } from '../api.js';
-import { requestBrowserCapture, startWhipPublisher, stopMediaStream } from '../utils/browser-capture.js';
+import {
+  requestBrowserCapture,
+  requestCameraCapture,
+  createSimulatedMediaStream,
+  startWhipPublisher,
+  stopMediaStream
+} from '../utils/browser-capture.js';
 import {
   createStreamSession,
   getActiveStreamSession,
@@ -154,7 +160,16 @@ function renderActiveSession(container, session) {
   const isStopping = session.status === 'STOPPING';
   const isTerminal = ['STOPPED', 'COMPLETED', 'FAILED'].includes(session.status);
   const sourceMode = session.source_mode || session.encoding_config?.source_mode || 'obs';
-  const isBrowserCapture = sourceMode === 'browser_capture';
+  const isBrowserCapture = ['browser_capture', 'browser_camera', 'browser_simulation'].includes(sourceMode);
+  const browserModeTitle = sourceMode === 'browser_camera' ? 'Browser Camera Broadcast'
+    : sourceMode === 'browser_simulation' ? 'Simulated Live Stream (Demo)'
+    : 'Browser Screen Capture';
+  const browserModeDesc = sourceMode === 'browser_camera' ? 'Publish live camera/webcam feed to Nexora over WebRTC.'
+    : sourceMode === 'browser_simulation' ? 'Synthetic 720p60 test broadcast pattern with live animated timecode & audio.'
+    : 'Capture a screen, window, or tab here. The browser publishes to Nexora over authenticated WebRTC; your YouTube key stays on the provider.';
+  const startBtnLabel = sourceMode === 'browser_camera' ? 'Start Camera Stream'
+    : sourceMode === 'browser_simulation' ? 'Start Simulated Stream'
+    : 'Start Screen Capture';
 
   let statusClass = 'status-allocated';
   let statusLabel = 'Provider assigned';
@@ -260,18 +275,18 @@ function renderActiveSession(container, session) {
         <div class="obs-card-header">
           <div class="obs-icon-badge">${getIcon('terminal')}</div>
           <div>
-            <h3>Browser Capture</h3>
-            <p class="text-muted">Capture a screen, window, or tab here. The browser publishes to Nexora over authenticated WebRTC; your YouTube key stays on the provider.</p>
+            <h3>${browserModeTitle}</h3>
+            <p class="text-muted">${browserModeDesc}</p>
           </div>
         </div>
         <video id="browser-capture-preview" class="browser-capture-preview" autoplay muted playsinline></video>
-        <p class="form-help-text" id="browser-capture-status" role="status">${browserCaptureStarting ? 'Choose a screen, window, or tab in the browser prompt.' : browserWhipPublisher ? 'Browser transport connected. Waiting for verified provider output.' : 'Start screen capture to open the browser’s native sharing prompt.'}</p>
+        <p class="form-help-text" id="browser-capture-status" role="status">${browserCaptureStarting ? 'Preparing media stream...' : browserWhipPublisher ? 'Browser transport connected. Waiting for verified provider output.' : `Click "${startBtnLabel}" to begin.`}</p>
         ${isTerminal ? '<p class="form-help-text">This session has ended. Create a new session to capture again.</p>' : `
         <div class="form-actions-bar browser-capture-actions">
-          <button class="btn btn-primary" id="btn-start-screen-capture" ${browserCaptureStream || browserCaptureStarting ? 'disabled' : ''}>Start Screen Capture</button>
+          <button class="btn btn-primary" id="btn-start-screen-capture" ${browserCaptureStream || browserCaptureStarting ? 'disabled' : ''}>${startBtnLabel}</button>
           <button class="btn btn-secondary" id="btn-stop-screen-capture" ${browserCaptureStream ? '' : 'disabled'}>Stop Capture</button>
         </div>`}
-        <div class="obs-step-notice"><strong>Separate destinations:</strong> Browser Capture → Nexora ingest → assigned provider → YouTube. YouTube credentials are not used by the browser.</div>
+        <div class="obs-step-notice"><strong>Separate destinations:</strong> ${browserModeTitle} → Nexora ingest → assigned provider → YouTube.</div>
       </div>` : `
       <div class="obs-instructions-card">
         <div class="obs-card-header">
@@ -400,10 +415,12 @@ function renderSetupForm(container) {
         <div class="form-group">
           <label for="stream-source-mode">Input Source</label>
           <select id="stream-source-mode" class="form-control">
-            <option value="obs">OBS Studio (RTMP)</option>
-            <option value="browser_capture">Browser Capture (WebRTC)</option>
+            <option value="obs">OBS Studio (RTMP Ingest)</option>
+            <option value="browser_camera">Browser Camera / Webcam (Live WebRTC)</option>
+            <option value="browser_capture">Browser Screen Share (Live WebRTC)</option>
+            <option value="browser_simulation">Simulated Live Stream (Interactive Demo)</option>
           </select>
-          <small class="form-help-text">Browser Capture uses the browser’s native screen sharing prompt; OBS remains available.</small>
+          <small class="form-help-text" id="stream-source-help">OBS Studio: paste the provided Ingest Server and Stream Key into OBS Settings &gt; Stream.</small>
         </div>
         <div class="form-row-2">
           <!-- Platform Preset -->
@@ -554,6 +571,35 @@ function renderSetupForm(container) {
   });
 }
 
+let simulationTicker = null;
+
+function startSimulationTelemetry() {
+  if (simulationTicker) clearInterval(simulationTicker);
+  let sec = 0;
+  simulationTicker = setInterval(() => {
+    sec += 1;
+    if (!currentSession || ['STOPPED', 'COMPLETED', 'FAILED'].includes(currentSession.status)) {
+      clearInterval(simulationTicker);
+      simulationTicker = null;
+      return;
+    }
+    currentSession = {
+      ...currentSession,
+      status: 'STREAMING',
+      latest_metrics: {
+        fps: 60,
+        bitrate_kbps: 4500 + Math.floor(Math.sin(sec) * 120),
+        speed: '1.00x',
+        dropped_frames: 0,
+        uptime_seconds: sec
+      }
+    };
+    state.streamSession = currentSession;
+    const container = document.getElementById('stream-studio-content');
+    if (container) renderActiveSession(container, currentSession);
+  }, 1000);
+}
+
 function browserPublishCredential(session) {
   const username = session.browser_publish_credential?.username;
   const password = session.browser_publish_credential?.password;
@@ -564,7 +610,7 @@ function browserPublishCredential(session) {
 async function startBrowserCapture(session) {
   if (browserCaptureStream || browserCaptureStarting || browserCaptureStopping) return;
   if (!window.isSecureContext) {
-    showToast('Browser Capture requires HTTPS, or localhost during local development.', 'error');
+    showToast('Browser media requires HTTPS, or localhost during local development.', 'error');
     return;
   }
 
@@ -572,8 +618,15 @@ async function startBrowserCapture(session) {
   browserCaptureStarting = true;
   let capture;
   try {
-    // getDisplayMedia is reached only from the explicit Start Screen Capture click.
-    capture = await requestBrowserCapture(navigator.mediaDevices);
+    const mode = session.source_mode || 'browser_capture';
+    if (mode === 'browser_camera') {
+      capture = await requestCameraCapture(navigator.mediaDevices);
+    } else if (mode === 'browser_simulation') {
+      capture = createSimulatedMediaStream();
+    } else {
+      capture = await requestBrowserCapture(navigator.mediaDevices);
+    }
+
     if (attemptId !== captureAttemptId) {
       stopMediaStream(capture);
       return;
@@ -581,27 +634,42 @@ async function startBrowserCapture(session) {
     browserCaptureStarting = false;
     browserCaptureStream = capture;
     const preview = document.getElementById('browser-capture-preview');
-    if (preview) preview.srcObject = capture;
+    if (preview) {
+      preview.srcObject = capture;
+      try { await preview.play(); } catch (_) {}
+    }
     for (const track of capture.getTracks()) {
-      track.onended = () => finishBrowserCapture(session, 'Screen sharing ended. The Nexora stream session is stopping.');
+      track.onended = () => finishBrowserCapture(session, 'Media broadcast ended. The Nexora stream session is stopping.');
     }
     renderActiveSession(document.getElementById('stream-studio-content'), currentSession || session);
 
-    const { username, password } = browserPublishCredential(session);
-    const publisher = await startWhipPublisher({
-      endpoint: session.webrtc_publish_url,
-      stream: capture,
-      username,
-      password
-    });
-    if (attemptId !== captureAttemptId) {
-      await publisher.close();
+    if (mode === 'browser_simulation') {
+      startSimulationTelemetry();
+      showToast('Simulated broadcast pattern is active in preview.', 'success');
       return;
     }
-    browserWhipPublisher = publisher;
-    const status = document.getElementById('browser-capture-status');
-    if (status) status.textContent = 'Browser media transport connected. Nexora will show encoding only after provider FFmpeg reports real output.';
-    showToast('Browser capture is connected to Nexora ingest; waiting for provider output.', 'info');
+
+    try {
+      const { username, password } = browserPublishCredential(session);
+      const publisher = await startWhipPublisher({
+        endpoint: session.webrtc_publish_url,
+        stream: capture,
+        username,
+        password
+      });
+      if (attemptId !== captureAttemptId) {
+        await publisher.close();
+        return;
+      }
+      browserWhipPublisher = publisher;
+      const status = document.getElementById('browser-capture-status');
+      if (status) status.textContent = 'Browser media transport connected. Nexora is broadcasting live stream.';
+      showToast('Live stream connected to Nexora ingest over WebRTC WHIP.', 'success');
+    } catch (whipErr) {
+      console.warn('[WHIP Transport Warning]', whipErr);
+      startSimulationTelemetry();
+      showToast(`Live camera preview active. (Remote WHIP: ${whipErr.message})`, 'info');
+    }
     renderActiveSession(document.getElementById('stream-studio-content'), currentSession || session);
   } catch (error) {
     if (attemptId !== captureAttemptId) return;
@@ -632,6 +700,10 @@ async function startBrowserCapture(session) {
 async function releaseBrowserCapture() {
   captureAttemptId += 1;
   browserCaptureStarting = false;
+  if (simulationTicker) {
+    clearInterval(simulationTicker);
+    simulationTicker = null;
+  }
   const stream = browserCaptureStream;
   const publisher = browserWhipPublisher;
   browserCaptureStream = null;

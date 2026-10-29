@@ -166,9 +166,24 @@ export function openJobModal() {
       document.getElementById('fibo-index').addEventListener('input', updateEstimates);
     } else if (val === 'custom_python') {
       specificContainer.innerHTML = `
-        <div class="form-group">
-          <label class="form-label" for="custom-py-code">Python Execution Script</label>
-          <textarea id="custom-py-code" class="textarea textarea-mono" spellcheck="false"># Nexora Workload Script
+        <div class="form-group" style="margin-bottom: var(--space-3);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <label class="form-label" for="custom-py-code" style="margin-bottom: 0;">Python Execution Script</label>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <select id="py-template-select" class="select" style="font-size: 11px; padding: 2px 8px; height: 26px;">
+                <option value="math" selected>Template: Compute Checksum</option>
+                <option value="stdin">Template: Interactive Stdin Input</option>
+                <option value="sysinfo">Template: Provider Hardware Info</option>
+                <option value="primes">Template: Prime Factorization</option>
+                <option value="blank">Blank Script</option>
+              </select>
+              <label class="btn btn-secondary btn-sm" style="font-size: 11px; padding: 2px 8px; height: 26px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px;">
+                <span>Upload .py</span>
+                <input type="file" id="py-file-upload" accept=".py,.txt" style="display: none;" />
+              </label>
+            </div>
+          </div>
+          <textarea id="custom-py-code" class="textarea textarea-mono" spellcheck="false" style="min-height: 140px; font-size: 12px; line-height: 1.45;"># Nexora Custom Workload Script
 import sys, math
 
 print("Initiating custom compute execution...")
@@ -176,12 +191,105 @@ total = sum(math.sqrt(i) for i in range(1, 100000))
 print(f"Computed total checksum: {total:.4f}")
 </textarea>
         </div>
+        <div class="form-group" style="margin-bottom: var(--space-3);">
+          <label class="form-label" for="custom-py-stdin">User Input Data (stdin - passed to input() / sys.stdin)</label>
+          <textarea id="custom-py-stdin" class="textarea textarea-mono" style="min-height: 55px; font-size: 12px;" placeholder="Optional text, numbers, or parameters for script to read from stdin..."></textarea>
+          <div class="form-help">Any lines entered here will be supplied to the script process via standard input.</div>
+        </div>
         <div class="form-group" style="margin-bottom: 0;">
           <label class="form-label" for="py-timeout">Execution Timeout (Seconds)</label>
           <input type="number" id="py-timeout" class="input input-mono" value="20" min="5" max="180" />
         </div>
       `;
-      document.getElementById('custom-py-code').addEventListener('input', updateEstimates);
+
+      const codeArea = document.getElementById('custom-py-code');
+      const stdinArea = document.getElementById('custom-py-stdin');
+      const templateSelect = document.getElementById('py-template-select');
+      const fileUpload = document.getElementById('py-file-upload');
+
+      const TEMPLATES = {
+        math: `# Nexora Custom Workload Script
+import sys, math
+
+print("Initiating custom compute execution...")
+total = sum(math.sqrt(i) for i in range(1, 100000))
+print(f"Computed total checksum: {total:.4f}")
+`,
+        stdin: `# Interactive Input Demonstration
+import sys
+
+print("Reading user input from stdin...")
+data = sys.stdin.read().strip()
+if data:
+    lines = data.splitlines()
+    print(f"Received {len(lines)} line(s) of input:")
+    for idx, line in enumerate(lines, 1):
+        print(f"  [{idx}] {line.upper()}")
+    print(f"Total characters processed: {len(data)}")
+else:
+    print("No stdin input provided. Pass data in the User Input box below!")
+`,
+        sysinfo: `# Provider Environment Inspector
+import sys, platform, os
+
+print(f"Python Version: {sys.version.split()[0]}")
+print(f"Platform: {platform.platform()}")
+print(f"Machine: {platform.machine()}")
+print(f"Process ID: {os.getpid()}")
+print("Environment inspection completed successfully.")
+`,
+        primes: `# Prime Factorization Compute
+def factorize(n):
+    factors = []
+    d = 2
+    while d * d <= n:
+        while n % d == 0:
+            factors.append(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.append(n)
+    return factors
+
+number = 9876543210
+print(f"Calculating prime factors of {number}...")
+result = factorize(number)
+print(f"Prime factors: {result}")
+`,
+        blank: `# Write your custom Python code here
+import sys
+
+print("Hello from Nexora Compute Provider!")
+`
+      };
+
+      if (templateSelect) {
+        templateSelect.addEventListener('change', () => {
+          const t = TEMPLATES[templateSelect.value] || TEMPLATES.math;
+          codeArea.value = t;
+          if (templateSelect.value === 'stdin' && !stdinArea.value) {
+            stdinArea.value = "Alpha compute node\\nBeta cluster task\\nGamma processing line";
+          }
+          updateEstimates();
+        });
+      }
+
+      if (fileUpload) {
+        fileUpload.addEventListener('change', (e) => {
+          const file = e.target.files[0];
+          if (file) {
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+              codeArea.value = evt.target.result;
+              showToast(`Loaded "${file.name}" into editor`, 'info');
+              updateEstimates();
+            };
+            reader.readAsText(file);
+          }
+        });
+      }
+
+      codeArea.addEventListener('input', updateEstimates);
     } else if (val === 'video_compress') {
       specificContainer.innerHTML = `
         <div class="form-group">
@@ -325,6 +433,7 @@ print(f"Computed total checksum: {total:.4f}")
       requirements.matrix_size = Number(document.getElementById('fibo-index').value);
     } else if (workload === 'custom_python') {
       requirements.python_code = document.getElementById('custom-py-code').value;
+      requirements.stdin_input = document.getElementById('custom-py-stdin')?.value || '';
       requirements.timeout_seconds = Number(document.getElementById('py-timeout').value) || 20;
       requirements.file_name = `${name.replace(/\s+/g, '_')}.py`;
     } else if (workload === 'video_compress') {
