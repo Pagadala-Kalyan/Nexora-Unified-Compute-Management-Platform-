@@ -14,11 +14,17 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: PROVIDER_SHARED_TOKEN
-        value: local-demo-token
+        generateValue: true
       - key: CORS_ORIGINS
         value: https://nexora-unified-compute-management-platform-12oxepi7d.vercel.app
       - key: CORS_ORIGIN_REGEX
         value: https://.*\.vercel\.app
+      - key: MEDIAMTX_INGEST_URL
+        sync: false
+      - key: MEDIAMTX_PROVIDER_READ_URL
+        sync: false
+      - key: MEDIA_SERVER_ALLOW_LOOPBACK
+        value: "false"
 
 databases:
   - name: nexora-db

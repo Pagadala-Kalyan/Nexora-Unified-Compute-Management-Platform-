@@ -18,11 +18,22 @@ import psutil
 import requests
 import shutil
 import argparse
+import queue
+import re
+import urllib.parse
 from pathlib import Path
 
 
 def get_ffmpeg_binary():
-    """Locate FFmpeg: check PATH first, then imageio_ffmpeg fallback."""
+    """Locate FFmpeg using an explicit executable path, PATH, then imageio_ffmpeg."""
+    configured = os.getenv("NEXORA_FFMPEG_PATH") or os.getenv("FFMPEG_PATH")
+    if configured:
+        configured = configured.strip().strip('"')
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+        # Also allow a command name that can be resolved using the Windows PATH.
+        return shutil.which(configured)
     found = shutil.which("ffmpeg")
     if found:
         return found
@@ -44,6 +55,8 @@ def get_ffmpeg_version():
             text=True,
             timeout=5
         )
+        if result.returncode != 0:
+            return None
         first_line = result.stdout.split("\n")[0].strip()
         return first_line or "unknown"
     except Exception:
@@ -107,6 +120,7 @@ BASE = os.getenv(
 ).rstrip("/")
 
 is_connected = False
+ALLOW_LOCAL_BACKEND_FAILOVER = False
 
 TOKEN = os.getenv(
     "PROVIDER_SHARED_TOKEN",
@@ -190,6 +204,8 @@ HEAD = {
 }
 
 active_jobs = 0
+active_streams = {}
+active_streams_lock = threading.Lock()
 
 
 # ============================================================
@@ -294,6 +310,32 @@ def get_system_info():
             f"GPU detection warning: {e}"
         )
 
+    if not gpu_name:
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3, check=True,
+            )
+            rows = [row.split(",", 1) for row in result.stdout.splitlines() if "," in row]
+            if rows:
+                gpu_name = ", ".join(row[0].strip() for row in rows)
+                gpu_count = len(rows)
+                gpu_memory_gb = round(sum(float(row[1].strip()) for row in rows) / 1024, 2)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    if not gpu_name and platform.system() == "Windows":
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                capture_output=True, text=True, timeout=5,
+            )
+            names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if names:
+                gpu_name = ", ".join(names)
+                gpu_count = len(names)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     # -------------------------
     # Disk
     # -------------------------
@@ -371,6 +413,33 @@ def get_system_info():
 
 
 SYSTEM_INFO = get_system_info()
+
+def get_stream_encoders():
+    """Return H.264 encoders compiled in FFmpeg and able to initialize here."""
+    binary = get_ffmpeg_binary()
+    if not binary:
+        return []
+    try:
+        result = subprocess.run([binary, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=8)
+        text = (result.stdout or "") + (result.stderr or "")
+        compiled = [name for name in ("libx264", "h264_nvenc", "h264_qsv", "h264_amf") if re.search(rf"\b{name}\b", text)]
+        working = []
+        for name in compiled:
+            try:
+                probe = subprocess.run(
+                    [binary, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+                     "-frames:v", "1", "-c:v", name, "-f", "null", "-"],
+                    capture_output=True, text=True, timeout=8
+                )
+                if probe.returncode == 0:
+                    working.append(name)
+            except (OSError, subprocess.SubprocessError):
+                continue
+        return working
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+STREAM_ENCODERS = get_stream_encoders()
 
 
 # ============================================================
@@ -512,7 +581,8 @@ def register(retry_indefinitely=True):
             **SYSTEM_INFO,
             "ffmpeg_available": bool(_ffmpeg_bin),
             "ffmpeg_version": _ffmpeg_ver,
-            "stream_encode_capable": bool(_ffmpeg_bin),
+            "stream_encode_capable": bool(_ffmpeg_bin and STREAM_ENCODERS),
+            "stream_encoders": STREAM_ENCODERS,
         }
     }
 
@@ -547,6 +617,7 @@ def register(retry_indefinitely=True):
         f"FFmpeg    : "
         f"{_ffmpeg_ver or ('Available' if _ffmpeg_bin else 'None')}"
     )
+    print(f"H.264 encoders: {', '.join(STREAM_ENCODERS) if STREAM_ENCODERS else 'None (streaming unavailable)'}")
     print(
         f"OS        : "
         f"{SYSTEM_INFO['os']}"
@@ -571,11 +642,21 @@ def register(retry_indefinitely=True):
             return response
         except Exception as e:
             is_connected = False
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code in (401, 403):
+                raise RuntimeError(
+                    f"Provider authentication was rejected by {BASE} (HTTP {status_code}). "
+                    "Set PROVIDER_SHARED_TOKEN to the same value on this provider and backend; "
+                    "the token value is intentionally not shown."
+                ) from None
             if not retry_indefinitely:
                 raise
 
-            # If local host was targeted and unreachable, switch to online cloud backend
-            if BASE == DEFAULT_LOCAL_URL and attempt >= 2:
+            # Only auto-discovered local endpoints may fail over, and only for
+            # transport failures. An HTTP response proves a server was reached
+            # and must not silently register the provider elsewhere.
+            transport_failure = isinstance(e, (requests.ConnectionError, requests.Timeout))
+            if ALLOW_LOCAL_BACKEND_FAILOVER and BASE == DEFAULT_LOCAL_URL and attempt >= 2 and transport_failure:
                 print(f"[AUTO-FAILOVER] Localhost unreachable. Switching to cloud control plane ({DEFAULT_ONLINE_URL})...")
                 BASE = DEFAULT_ONLINE_URL
 
@@ -599,7 +680,7 @@ def heartbeat():
                     "POST",
                     f"/providers/{PID}/heartbeat",
                     json={
-                        "status": "BUSY" if active_jobs else "ONLINE",
+                        "status": "BUSY" if active_jobs or active_streams else "ONLINE",
                         "utilization": utilization()
                     },
                     timeout=8
@@ -1213,197 +1294,346 @@ def run_video_compress(job, report_progress):
 # REMOTE STREAM ENCODING WORKLOAD
 # ============================================================
 
-active_stream_session_id = None
-active_stream_stop_event = threading.Event()
+def _stream_error_message(lines, input_seen):
+    text = " ".join(lines).lower()
+    if any(term in text for term in ("403", "unauthorized", "authentication failed", "invalid stream key", "publish.badname", "publish failed", "server error")):
+        if not input_seen:
+            return "The provider could not authenticate its read access to Nexora ingest. Stop and recreate the stream session."
+        return "The destination rejected the stream credentials. Verify the destination stream key and try again."
+    if input_seen and any(term in text for term in (
+        "error writing header", "error writing trailer", "error muxing a packet", "av_interleaved_write_frame",
+        "broken pipe", "failed to write packet", "could not write", "connection reset by peer",
+    )):
+        return "FFmpeg received media but could not publish encoded output to the destination. Verify the destination ingest URL, stream key, and network connection."
+    if any(term in text for term in ("connection refused", "connection timed out", "network is unreachable", "could not resolve", "end of file")):
+        if not input_seen:
+            return "The provider could not read media from Nexora ingest. Confirm OBS or Browser Capture is publishing to this session and that the provider can reach MediaMTX."
+        return "The provider could not reach the destination server. Check its address and network availability."
+    if "encoder" in text and any(term in text for term in ("not found", "cannot load", "failed to open", "no capable devices")):
+        return "The selected FFmpeg encoder is not available on this provider. Install a supported FFmpeg build and retry."
+    if not input_seen:
+        return "No media input arrived before the provider timeout. Start OBS or Browser Capture publishing to Nexora before the timeout and try again."
+    return "The provider could not complete stream encoding. Check the input and destination configuration."
 
-def run_stream_encoder(stream_data):
-    """
-    Long-running remote stream encoder subprocess runner.
-    Pulls live source stream from MediaMTX, transcodes with FFmpeg,
-    pushes to destination RTMP(S), and streams live telemetry to control plane.
-    """
-    global active_stream_session_id, active_stream_stop_event
 
-    binary = get_ffmpeg_binary()
-    if not binary:
-        print("[STREAM] FFmpeg binary not found. Cannot start stream encoding.")
-        return
+def _build_stream_ffmpeg_args(binary, stream_data, cfg, encoder):
+    """Build a safe-argument-list FFmpeg command; never log the credential URL."""
+    width, height = int(cfg.get("width", 1280)), int(cfg.get("height", 720))
+    fps = int(cfg.get("fps", 30))
+    v_bitrate = int(cfg.get("video_bitrate_kbps", 3000))
+    a_bitrate = int(cfg.get("audio_bitrate_kbps", 160))
+    destination_url = urllib.parse.urlsplit(stream_data["destination_url"])
+    destination_key = urllib.parse.quote(stream_data.get("destination_key", ""), safe="/-_.~")
+    destination_path = f"{destination_url.path.rstrip('/')}/{destination_key}" if destination_key else destination_url.path
+    destination = urllib.parse.urlunsplit((destination_url.scheme, destination_url.netloc, destination_path, destination_url.query, ""))
 
+    args = [binary, "-hide_banner", "-nostdin", "-loglevel", "info", "-rtsp_transport", "tcp",
+            "-i", stream_data["source_url"], "-vf",
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+            "-r", str(fps), "-c:v", encoder]
+    if encoder == "libx264":
+        args += ["-preset", cfg.get("preset", "veryfast")]
+    elif encoder == "h264_nvenc":
+        args += ["-preset", "p4"]
+    elif encoder == "h264_qsv":
+        args += ["-preset", "veryfast"]
+    elif encoder == "h264_amf":
+        args += ["-quality", "balanced"]
+    args += ["-b:v", f"{v_bitrate}k", "-maxrate", f"{v_bitrate + 500}k", "-bufsize", f"{v_bitrate * 2}k",
+             "-pix_fmt", "yuv420p", "-g", str(fps * 2), "-c:a", "aac", "-b:a", f"{a_bitrate}k", "-ar", "48000",
+             "-f", "flv", "-stats_period", "1", "-progress", "pipe:1", "-nostats", destination]
+    return args
+
+
+def run_stream_encoder(stream_data, stop_event, retry_attempt=0, input_deadline=None):
+    """Run one session-scoped FFmpeg process; only measured FFmpeg progress is reported."""
     session_id = stream_data["session_id"]
-    source_url = stream_data["source_url"]
-    dest_url = stream_data["destination_url"].rstrip("/")
-    dest_key = stream_data.get("destination_key", "")
-    full_dest = f"{dest_url}/{dest_key}" if dest_key else dest_url
+    provider_id = stream_data["provider_id"]
+    binary = get_ffmpeg_binary()
+    proc = None
+    error_lines = []
+    input_seen = False
+    state_lock = threading.Lock()
+    metrics = {"status": "STARTING"}
+    status_value = ["STARTING"]
+    started = time.monotonic()
+    input_timeout = max(1, int(os.getenv("STREAM_INPUT_TIMEOUT_SECONDS", "90")))
+    # A provider can claim a session before OBS or Browser Capture has started
+    # publishing. Keep the session and its short-lived ingest credential valid
+    # through this entire initial-input window, even when RTSP DESCRIBE returns
+    # 404 and FFmpeg exits immediately.
+    input_deadline = input_deadline if input_deadline is not None else started + input_timeout
+    stdout_queue = queue.Queue()
+    stderr_queue = queue.Queue()
+    requested_stop = [False]
+    last_heartbeat = 0.0
+    readers = []
+    retrying = False
+
+    def update_status(new_status):
+        with state_lock:
+            if status_value[0] == new_status:
+                return False
+            status_value[0] = new_status
+            metrics["status"] = new_status
+            snapshot = dict(metrics)
+        try:
+            response = request("POST", f"/providers/streams/{session_id}/heartbeat", json={
+                "provider_id": provider_id, "status": new_status, "metrics": snapshot,
+            }, timeout=8)
+            if response.status_code == 200:
+                reply = response.json()
+                return reply.get("command") == "STOP_STREAM" or reply.get("action") == "stop"
+        except requests.RequestException:
+            print("[STREAM STATUS] Could not report a state change; will retry on heartbeat.")
+        return False
+
+    def progress_reader():
+        try:
+            for line in proc.stdout:
+                stdout_queue.put(line.rstrip("\r\n"))
+        finally:
+            stdout_queue.put(None)
+
+    def diagnostic_reader():
+        nonlocal input_seen
+        try:
+            for line in proc.stderr:
+                low = line.lower()
+                if "input #0" in low:
+                    input_seen = True
+                    stderr_queue.put("INPUT")
+                if input_seen:
+                    fps_match = re.search(r"\b(\d+(?:\.\d+)?)\s*fps\b", low)
+                    if fps_match:
+                        with state_lock:
+                            metrics["input_fps"] = float(fps_match.group(1))
+                    bitrate_match = re.search(r"\bbitrate:\s*(\d+(?:\.\d+)?)\s*kb/s", low)
+                    if bitrate_match:
+                        with state_lock:
+                            metrics["input_bitrate_kbps"] = float(bitrate_match.group(1))
+                if any(word in low for word in ("error", "failed", "refused", "timed out", "unauthorized", "403", "not found", "no capable devices", "cannot load", "end of file")):
+                    error_lines.append(line[:400])
+        finally:
+            stderr_queue.put(None)
+
+    print(f"\n[STREAM RECEIVED] {session_id} | profile: {stream_data.get('profile_name')} | assigned provider: {provider_id}")
+    print("[STREAM] Waiting for authenticated source input; destination credentials are hidden.")
+    if not binary:
+        error = "FFmpeg is not installed or could not be found on this provider."
+        try:
+            request("POST", f"/providers/streams/{session_id}/stopped", json={"provider_id": provider_id, "status": "FAILED", "error": error})
+        except requests.RequestException:
+            pass
+        with active_streams_lock:
+            active_streams.pop(session_id, None)
+        return
 
     cfg = stream_data.get("encoding_config") or {}
-    width = cfg.get("width", 1280)
-    height = cfg.get("height", 720)
-    fps = cfg.get("fps", 60)
-    v_bitrate = cfg.get("video_bitrate_kbps", 4500)
-    a_bitrate = cfg.get("audio_bitrate_kbps", 160)
-    preset = cfg.get("preset", "veryfast")
-
-    active_stream_session_id = session_id
-    active_stream_stop_event.clear()
-
-    print()
-    print("=" * 60)
-    print(f"[STREAM STARTING] Session: {session_id}")
-    print(f"[STREAM PROFILE] {width}x{height} @ {fps}fps | {v_bitrate}k video, {a_bitrate}k audio")
-    print(f"[STREAM SOURCE]  {source_url}")
-    print(f"[STREAM DEST]    {dest_url}/****")
-    print("=" * 60)
-    print()
-
-    # Build safe FFmpeg argument array (strictly no shell interpolation)
-    cmd = [
-        binary,
-        "-y",
-        "-re",
-        "-i", source_url,
-        "-vf", f"scale={width}:{height}",
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-b:v", f"{v_bitrate}k",
-        "-maxrate", f"{v_bitrate + 500}k",
-        "-bufsize", f"{v_bitrate * 2}k",
-        "-pix_fmt", "yuv420p",
-        "-g", str(fps * 2),
-        "-c:a", "aac",
-        "-b:a", f"{a_bitrate}k",
-        "-ar", "48000",
-        "-f", "flv",
-        "-progress", "pipe:1",
-        "-nostats",
-        full_dest
-    ]
-
-    metrics = {
-        "status": "starting",
-        "fps": 0.0,
-        "bitrate_kbps": 0.0,
-        "speed": "0.0x",
-        "dropped_frames": 0,
-        "uptime_seconds": 0
-    }
-    metrics_lock = threading.Lock()
-    start_time = time.time()
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True
-        )
-    except Exception as e:
-        print(f"[STREAM ERROR] Failed to spawn FFmpeg: {e}")
+    fps = int(cfg.get("fps", 30))
+    encoders = set(STREAM_ENCODERS)
+    selected = cfg.get("video_encoder", "libx264")
+    if selected not in encoders:
+        selected = "libx264" if "libx264" in encoders else None
+    if not selected:
         try:
-            request("POST", f"/providers/streams/{session_id}/stopped", json={
-                "status": "FAILED",
-                "error": str(e)
-            })
-        except Exception:
+            request("POST", f"/providers/streams/{session_id}/stopped", json={"provider_id": provider_id, "status": "FAILED", "error": "No compatible H.264 encoder is available in FFmpeg on this provider."})
+        except requests.RequestException:
             pass
-        active_stream_session_id = None
+        with active_streams_lock:
+            active_streams.pop(session_id, None)
         return
 
-    def stream_telemetry_loop():
-        while not active_stream_stop_event.is_set():
-            time.sleep(5)
-            if active_stream_stop_event.is_set():
-                break
-            uptime = int(time.time() - start_time)
-            with metrics_lock:
-                metrics["uptime_seconds"] = uptime
-                current_metrics = dict(metrics)
-
-            try:
-                resp = request("POST", f"/providers/streams/{session_id}/heartbeat", json={
-                    "status": "ENCODING",
-                    "metrics": current_metrics
-                }, timeout=6)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    action = data.get("action")
-                    if action == "stop":
-                        print(f"[STREAM STOP] Control plane requested stop ({data.get('reason')})")
-                        active_stream_stop_event.set()
-                        if proc and proc.poll() is None:
-                            proc.terminate()
-                        break
-            except Exception as ex:
-                print(f"[STREAM TELEMETRY ERROR] {ex}")
-
-    hb_thread = threading.Thread(target=stream_telemetry_loop, daemon=True)
-    hb_thread.start()
+    args = _build_stream_ffmpeg_args(binary, stream_data, cfg, selected)
 
     try:
-        for line in proc.stdout:
-            line = line.strip()
-            if line.startswith("fps="):
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        readers = [threading.Thread(target=progress_reader, daemon=True), threading.Thread(target=diagnostic_reader, daemon=True)]
+        for reader in readers:
+            reader.start()
+        if update_status("WAITING_FOR_INPUT"):
+            stop_event.set()
+        progress_values = {}
+        saw_progress = False
+        last_input_at = time.monotonic()
+        while proc.poll() is None and not stop_event.is_set():
+            try:
+                line = stdout_queue.get(timeout=0.5)
+                if line and "=" in line:
+                    key, value = line.split("=", 1)
+                    progress_values[key] = value
+                    if key == "progress":
+                        frame = int(progress_values.get("frame", "0") or 0)
+                        measured = {}
+                        try:
+                            measured["fps"] = round(float(progress_values["fps"]), 2)
+                        except (KeyError, ValueError):
+                            pass
+                        bitrate = progress_values.get("bitrate", "").replace("kbits/s", "").strip()
+                        try:
+                            measured["bitrate_kbps"] = round(float(bitrate), 1)
+                        except ValueError:
+                            pass
+                        if progress_values.get("speed"):
+                            measured["speed"] = progress_values["speed"]
+                        try:
+                            measured["dropped_frames"] = int(progress_values["drop_frames"])
+                        except (KeyError, ValueError):
+                            pass
+                        measured["uptime_seconds"] = max(0, int(time.monotonic() - started))
+                        with state_lock:
+                            metrics.update(measured)
+                        if frame > 0:
+                            last_input_at = time.monotonic()
+                            if update_status("ENCODING"):
+                                stop_event.set()
+                            if progress_values.get("progress") == "continue" and not stop_event.is_set():
+                                if update_status("STREAMING"):
+                                    stop_event.set()
+                            saw_progress = True
+                elif line is None:
+                    time.sleep(0.1)
+            except queue.Empty:
+                pass
+            while True:
                 try:
-                    val = float(line.split("=", 1)[1].strip())
-                    with metrics_lock:
-                        metrics["fps"] = round(val, 1)
-                except ValueError:
-                    pass
-            elif line.startswith("bitrate="):
-                try:
-                    val_str = line.split("=", 1)[1].strip().replace("kbits/s", "").strip()
-                    val = float(val_str)
-                    with metrics_lock:
-                        metrics["bitrate_kbps"] = round(val, 1)
-                except ValueError:
-                    pass
-            elif line.startswith("speed="):
-                try:
-                    val_str = line.split("=", 1)[1].strip()
-                    with metrics_lock:
-                        metrics["speed"] = val_str
-                except Exception:
-                    pass
-            elif line.startswith("drop_frames="):
-                try:
-                    val = int(line.split("=", 1)[1].strip())
-                    with metrics_lock:
-                        metrics["dropped_frames"] = val
-                except ValueError:
-                    pass
-
-            if active_stream_stop_event.is_set():
+                    diagnostic = stderr_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if diagnostic == "INPUT":
+                    input_seen = True
+                    last_input_at = time.monotonic()
+                    if status_value[0] == "WAITING_FOR_INPUT":
+                        update_status("RECEIVING")
+            if ((not input_seen and time.monotonic() >= input_deadline)
+                    or (input_seen and time.monotonic() - last_input_at > input_timeout)):
+                error_lines.append("input timeout")
                 break
+            now = time.monotonic()
+            if now - last_heartbeat >= 5:
+                with state_lock:
+                    current_state, snapshot = status_value[0], dict(metrics)
+                try:
+                    response = request("POST", f"/providers/streams/{session_id}/heartbeat", json={
+                        "provider_id": provider_id, "status": current_state, "metrics": snapshot,
+                    }, timeout=8)
+                    response.raise_for_status()
+                    command_reply = response.json()
+                    if command_reply.get("command") == "STOP_STREAM" or command_reply.get("action") == "stop":
+                        requested_stop[0] = True
+                        stop_event.set()
+                        break
+                except (requests.RequestException, ValueError):
+                    print("[STREAM HEARTBEAT] Control plane unavailable; retrying.")
+                last_heartbeat = now
 
-    except Exception as read_err:
-        print(f"[STREAM READ WARNING] {read_err}")
+        for reader in readers:
+            reader.join(timeout=1)
+        while True:
+            try:
+                diagnostic = stderr_queue.get_nowait()
+            except queue.Empty:
+                break
+            if diagnostic == "INPUT":
+                input_seen = True
+
+        if stop_event.is_set():
+            final_status = "STOPPED" if requested_stop[0] or status_value[0] == "STOPPING" else "STOPPED"
+            failure = None
+        else:
+            return_code = proc.poll()
+            if return_code is None:
+                failure = _stream_error_message(error_lines, input_seen)
+                final_status = "FAILED"
+            elif return_code != 0:
+                failure = _stream_error_message(error_lines, input_seen)
+                final_status = "FAILED"
+            elif not saw_progress:
+                failure = "The input ended before FFmpeg produced an encoded output frame."
+                final_status = "FAILED"
+            else:
+                failure = None
+                final_status = "COMPLETED"
+
+        failure_text = " ".join(error_lines).lower()
+        selected_encoder = (stream_data.get("encoding_config") or {}).get("video_encoder", selected)
+        hardware_initialization_failure = (
+            not saw_progress and selected_encoder != "libx264"
+            and any(term in failure_text for term in ("encoder", "cuda", "nvenc", "qsv", "amf", "device"))
+        )
+        software_fallback = (
+            final_status == "FAILED" and selected_encoder != "libx264"
+            and "libx264" in encoders and hardware_initialization_failure
+        )
+        transient_network = (
+            final_status == "FAILED" and retry_attempt < 2
+            and any(term in failure_text for term in ("connection refused", "connection timed out", "network is unreachable", "could not resolve", "end of file"))
+            and not any(term in failure_text for term in ("401", "403", "unauthorized", "invalid stream key", "input timeout"))
+        )
+        waiting_for_publisher = (
+            final_status == "FAILED" and not input_seen and not saw_progress
+            and time.monotonic() < input_deadline
+            and any(term in failure_text for term in (
+                "404", "not found", "no stream", "end of file", "connection refused",
+                "connection timed out", "connection reset", "input timeout",
+            ))
+            and not any(term in failure_text for term in (
+                "401", "403", "unauthorized", "authentication failed", "invalid stream key",
+                "encoder", "cuda", "nvenc", "qsv", "amf", "no capable devices",
+            ))
+        )
+        if not stop_event.is_set() and (software_fallback or transient_network or waiting_for_publisher):
+            if software_fallback:
+                print(f"[STREAM] Hardware encoder {selected_encoder} failed to initialize; retrying with libx264.")
+                stream_data["encoding_config"]["video_encoder"] = "libx264"
+            elif waiting_for_publisher:
+                print("[STREAM] Ingest is not publishing yet; keeping the assigned session available while waiting for source media.")
+            else:
+                print(f"[STREAM] Media connection interrupted; reconnect attempt {retry_attempt + 1} of 2.")
+            retrying = True
+            with state_lock:
+                metrics.clear()
+            if update_status("STARTING") or update_status("WAITING_FOR_INPUT"):
+                stop_event.set()
+            backoff_seconds = min(2 * (retry_attempt + 1), max(0, input_deadline - time.monotonic())) if waiting_for_publisher else 2 * (retry_attempt + 1)
+            if stop_event.wait(backoff_seconds):
+                retrying = False
+                final_status = "STOPPED"
+                failure = None
+            elif waiting_for_publisher:
+                return run_stream_encoder(stream_data, stop_event, 0, input_deadline)
+            else:
+                return run_stream_encoder(stream_data, stop_event, retry_attempt + 1)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Do not include exception text because process arguments can contain private URLs.
+        failure = "FFmpeg could not start on this provider. Verify the installed FFmpeg build and retry."
+        final_status = "FAILED"
     finally:
-        active_stream_stop_event.set()
-        if proc.poll() is None:
+        if proc and proc.poll() is None:
             try:
                 proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
                 try:
                     proc.kill()
-                except Exception:
+                    proc.wait(timeout=3)
+                except (OSError, subprocess.TimeoutExpired):
                     pass
-
-        uptime = int(time.time() - start_time)
-        with metrics_lock:
-            metrics["uptime_seconds"] = uptime
+        with state_lock:
             final_metrics = dict(metrics)
-
-        print(f"[STREAM ENDED] Session {session_id} finished after {uptime}s.")
-        try:
-            request("POST", f"/providers/streams/{session_id}/stopped", json={
-                "status": "COMPLETED",
-                "metrics": final_metrics
-            })
-        except Exception as stop_report_err:
-            print(f"[STREAM REPORT ERROR] Could not notify control plane: {stop_report_err}")
-
-        active_stream_session_id = None
+        if not retrying:
+            try:
+                request("POST", f"/providers/streams/{session_id}/stopped", json={
+                    "provider_id": provider_id, "status": final_status,
+                    "metrics": final_metrics, "error": failure,
+                }, timeout=8)
+            except requests.RequestException:
+                print("[STREAM END] Could not report session termination to control plane.")
+            if final_status == "FAILED" and failure:
+                print(f"[STREAM ERROR] {session_id} | {failure}")
+            print(f"[STREAM {final_status}] {session_id} | encoder: {selected} | input detected: {bool(input_seen)}")
+            with active_streams_lock:
+                active_streams.pop(session_id, None)
 
 
 # ============================================================
@@ -1713,24 +1943,29 @@ def listener():
                     daemon=True
                 ).start()
 
-            # Check for assigned remote streaming sessions
-            if active_stream_session_id is None:
+            # Claim one assigned stream through the existing authenticated provider API.
+            if not active_streams:
                 try:
                     s_resp = request(
-                        "GET",
-                        f"/providers/{PID}/streams/pending",
+                        "POST",
+                        f"/providers/{PID}/streams/claim",
                         timeout=5
                     )
                     if s_resp.status_code == 200:
-                        pending_streams = s_resp.json()
-                        for stream_data in pending_streams:
-                            if active_stream_session_id is None:
-                                threading.Thread(
-                                    target=run_stream_encoder,
-                                    args=(stream_data,),
-                                    daemon=True
-                                ).start()
-                                break
+                        command = s_resp.json()
+                        stream_data = command.get("session") if command.get("command") == "START_STREAM" else None
+                        if stream_data and stream_data.get("provider_id") == PID:
+                            session_id = stream_data.get("session_id")
+                            stop_event = threading.Event()
+                            with active_streams_lock:
+                                if not active_streams:
+                                    active_streams[session_id] = stop_event
+                                    threading.Thread(
+                                        target=run_stream_encoder,
+                                        args=(stream_data, stop_event),
+                                        daemon=True,
+                                        name=f"nexora-stream-{session_id}",
+                                    ).start()
                 except Exception:
                     pass
 
@@ -1761,6 +1996,9 @@ if __name__ == "__main__":
 
     mode = "online" if args.online else ("local" if args.local else "auto")
     BASE = discover_backend_url(preferred_mode=mode, custom_url=args.url)
+    ALLOW_LOCAL_BACKEND_FAILOVER = (
+        mode == "auto" and not args.url and not os.getenv("UCMP_BACKEND_URL")
+    )
 
     print()
     print(

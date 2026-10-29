@@ -19,6 +19,11 @@ function ensureContainer() {
 
 export function showToast(message, type = 'info', duration = 3800) {
   const c = ensureContainer();
+  const displayMessage = typeof message === 'string'
+    ? message
+    : message instanceof Error && typeof message.message === 'string'
+      ? message.message
+      : 'Something went wrong. Please try again.';
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.setAttribute('role', 'alert');
@@ -32,11 +37,12 @@ export function showToast(message, type = 'info', duration = 3800) {
     <div style="color: ${type === 'success' ? 'var(--status-success)' : type === 'error' ? 'var(--status-error)' : type === 'warning' ? 'var(--status-warning)' : 'var(--accent-cyan)'}; display: flex; align-items: center;">
       ${getIcon(iconName)}
     </div>
-    <div style="flex: 1; min-width: 0; line-height: 1.35;">${message}</div>
+    <div class="toast-message" style="flex: 1; min-width: 0; line-height: 1.35;"></div>
     <button style="background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 2px;" aria-label="Dismiss">
       ${getIcon('close')}
     </button>
   `;
+  toast.querySelector('.toast-message').textContent = displayMessage;
 
   const closeBtn = toast.querySelector('button');
   closeBtn.addEventListener('click', () => {

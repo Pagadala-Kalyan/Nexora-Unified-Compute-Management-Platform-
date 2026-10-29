@@ -348,7 +348,7 @@ class TestBillingIdempotency:
         w.token_balance -= 50
         bill = JobBilling(job_id=job_id, estimated_tokens=50, reserved_tokens=50, actual_tokens=0)
         db.merge(bill)
-        j = Job(id=job_id, user_id=user_id, name="Billing Job", workload="fibonacci", status="RUNNING", requirements={}, attempt=2)
+        j = Job(id=job_id, user_id=user_id, provider_id="prov_billing", name="Billing Job", workload="fibonacci", status="RUNNING", requirements={}, attempt=2)
         db.merge(j)
         db.commit()
         db.close()

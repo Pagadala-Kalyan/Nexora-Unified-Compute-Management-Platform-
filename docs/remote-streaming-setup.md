@@ -1,0 +1,65 @@
+# Remote streaming setup
+
+Nexora's stream flow uses the existing provider polling API for provider commands and the existing user-scoped WebSocket topic for dashboard updates. Input can be supplied by OBS over RTMP or by the user's browser over WebRTC/WHIP:
+
+1. The dashboard creates a stream session. The control plane validates the wallet reserve, destination, provider heartbeat/capacity, FFmpeg availability, and a working H.264 encoder.
+2. The assigned provider claims that session over its authenticated provider API. The claim is single-use and returns only that provider the short-lived ingest-read and destination credentials.
+3. MediaMTX accepts OBS RTMP(S) input or Browser Capture WHIP input at the same `/live/<session-id>` path, validating the session's publish key and requiring the protocol selected for that session. The provider agent opens the corresponding authenticated RTSP(S) source, runs FFmpeg using the selected profile, and publishes to the destination.
+4. The provider reports STARTING, WAITING_FOR_INPUT, RECEIVING, ENCODING, and STREAMING only as each state is observed. FFmpeg progress values are passed through when available; missing measurements remain absent. Usage is billed only while FFmpeg has verified output progress and the control plane has received STREAMING state.
+5. Stop changes the session to STOPPING. The provider's next existing heartbeat receives STOP_STREAM, terminates only that session's FFmpeg process, reports STOPPED, and the control plane revokes the session credentials.
+
+## Local Docker demonstration
+
+Copy `.env.example` to `.env` (the latter is ignored by Git), replace the development secrets, then run `docker compose up --build`. This starts the FastAPI control plane, PostgreSQL, and MediaMTX 1.21.2 using `infra/mediamtx.yml`. MediaMTX exposes RTMP on TCP 1935, RTSP on TCP 8554, WHIP signaling on TCP 8889, and WebRTC media on UDP 8189. It authenticates session paths through the backend callback. The configured `~^live/[A-Za-z0-9_-]+$` path accepts only Nexora's session-specific stream paths.
+
+For local Browser Capture, set `MEDIAMTX_WEBRTC_URL=http://127.0.0.1:8889`, `MEDIAMTX_WEBRTC_ALLOWED_ORIGINS` to the local frontend origin(s), and `MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS=127.0.0.1`. The browser must be on the Docker host and use localhost (localhost is a secure context even over HTTP). In Live Stream Studio select **Browser Capture (WebRTC)**, create the session, and then click **Start Screen Capture**; the native browser picker and permission prompt open only after that click. A local preview appears while the browser negotiates WHIP with MediaMTX. Provider status and output metrics still wait for the provider's actual FFmpeg input/progress.
+
+The generated OBS values are `Server = MEDIAMTX_INGEST_URL/live` and `Stream Key = <session-id>?user=nexora&pass=<session-publish-secret>`. The secret is generated per session and only returned to its authenticated owner; the destination platform's key is never sent to OBS. In OBS choose **Custom...**, paste those two values, and click **Start Streaming**. Use these local defaults only when OBS and the provider agent run on the same computer as Docker. `127.0.0.1` means the machine running OBS/provider, not the backend or another device.
+
+For a provider or OBS device on the same LAN, replace both URLs in `.env` with the Docker host's LAN address, for example `rtmp://192.168.1.20:1935` and `rtsp://192.168.1.20:8554`; the example IP is illustrative, not a server supplied by Nexora. For Browser Capture from a LAN browser, also set `MEDIAMTX_WEBRTC_URL=http://<Docker-host-LAN-address>:8889`, add the frontend origin to `MEDIAMTX_WEBRTC_ALLOWED_ORIGINS`, and set `MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS` to the Docker host's reachable LAN address. Keep `MEDIA_SERVER_ALLOW_LOOPBACK=false` for multi-device use, restart Compose, and allow RTMP/RTSP/WHIP signaling TCP ports and WebRTC media UDP 8189 through the host firewall/router. Ensure the backend can receive MediaMTX's callback on its Compose network; the configured callback uses `http://backend:8000/stream/internal/mediamtx/auth` internally. `MEDIAMTX_INGEST_URL` is read by the backend and returned as the OBS server base, while `MEDIAMTX_PROVIDER_READ_URL` is sent only in the authenticated provider command.
+
+The OBS device is the user's capture/source device. It publishes to the ingest server; OBS is not required on the provider PC. The provider PC needs Python dependencies from `provider-server/requirements.txt` and FFmpeg with a working H.264 encoder. The provider checks `NEXORA_FFMPEG_PATH` first (or `FFMPEG_PATH`), then Windows PATH, then the optional `imageio_ffmpeg` package. Registration probes FFmpeg's H.264 encoders and initializes them with a tiny local test frame to confirm that the encoder can start on that hardware. This probe is not user telemetry and is never sent to the dashboard. Hardware encoding is selected only when that probe succeeds; otherwise libx264 is used when available.
+
+The currently running provider on the reported Windows PC already found FFmpeg 7.1 and initialized `libx264` and `h264_qsv`; that PC does not need another FFmpeg install. If a different provider reports no FFmpeg, use the Windows executable links listed by the [official FFmpeg download page](https://www.ffmpeg.org/download.html) (Windows builds are supplied by linked third-party maintainers). Extract the build so `ffmpeg.exe` is in a stable `bin` folder, then either add that folder to the Windows user PATH and reopen the provider terminal, or set `NEXORA_FFMPEG_PATH` to the full `ffmpeg.exe` path before starting the agent. Verify with `ffmpeg -version` and `ffmpeg -hide_banner -encoders | findstr /i "libx264 h264_qsv h264_nvenc h264_amf"`; the provider startup banner also reports which H.264 encoders actually initialize. Do not install a separate CUDA-only build for CPU encoding: `libx264` is sufficient.
+
+Browser Capture can negotiate VP8 or H.264 depending on browser codec capabilities. MediaMTX 1.21.2 and the provider's FFmpeg RTSP input support VP8; Nexora explicitly decodes/transcodes it to H.264 video and AAC audio in an FLV/RTMP output, so VP8 input is not copied through to YouTube. The MediaMTX message `received a non-starting fragment without any previous starting fragment` means a VP8 frame fragment arrived without its earlier starting fragment; this can happen when a reader joins mid-frame and is not by itself proof of malformed browser packetization. Repeated RTP packet-loss warnings indicate real packets were lost on the WebRTC UDP path. MediaMTX is configured with a 1 MB UDP read buffer to reduce socket-buffer drops. On Linux hosts, set `net.core.rmem_max` to at least `1000000` if the OS caps the socket buffer; the physical network still needs enough headroom, and loss can require a wired/less congested connection or reduced source bitrate.
+
+Provider FPS, bitrate, speed, and dropped-frame fields are parsed from FFmpeg's live `-progress` output. This confirms FFmpeg is processing and muxing output; RTMP has no application-level receipt proving YouTube Studio has accepted/displayed the broadcast. A real destination connection error fails the session and is reported as a sanitized message. Confirm the target ingest server and key in YouTube Studio, then verify its preview/stream health before considering the broadcast live.
+
+### YouTube demo sequence
+
+1. In YouTube Studio, create or select a Live broadcast and copy its ingest server and stream key.
+2. In Nexora's **Launch a New Remote Live Stream** form, leave the YouTube server preset or choose the server YouTube Studio provides. Paste the **YouTube** key into the destination-key field, then create the Nexora session. This key is for Nexora's provider output only.
+3. In the active session's **OBS → Nexora ingest** guide, copy the displayed Nexora ingest server and session-specific Nexora stream key. In OBS on the capture/source PC, open **Settings → Stream**, choose **Custom...**, paste those Nexora values, and apply them. Do not paste the YouTube key into OBS.
+4. Keep the Nexora session open so the provider is in **Waiting for OBS input**, then press **Start Streaming** in OBS. The provider should advance through receiving/encoding; output FPS and bitrate appear only after FFmpeg reports real progress.
+5. Confirm YouTube Studio's stream health/preview detects the encoded output before making the broadcast public or selecting **Go Live**. If Nexora times out before input, check OBS's connection status and that the OBS server is reachable from the source PC; a session allocation alone does not prove that YouTube received media.
+
+If OBS and the provider are on different devices, the default loopback URL will not work. Set the ingest and provider-read URLs to the Docker host's LAN/public address, allow the respective RTMP/RTSP ports through its firewall, and recreate the session after restarting the services.
+
+## Internet deployment
+
+Render's standard web service does not expose the TCP/UDP ports required for RTMP/RTSP/WebRTC media. Keep the FastAPI control plane on Render if desired, but deploy MediaMTX on a public VM/service that supports inbound streaming TCP/UDP ports and can reach the control plane's HTTPS auth callback. Set the MediaMTX HTTP authentication callback to the deployed backend's `https://<backend-host>/stream/internal/mediamtx/auth` address. In Render set:
+
+- `MEDIAMTX_INGEST_URL` to the public MediaMTX RTMP(S) base URL (for example `rtmps://media.example.com:1936`).
+- `MEDIAMTX_PROVIDER_READ_URL` to the public MediaMTX RTSP(S) base URL (for example `rtsps://media.example.com:8322`).
+- `MEDIAMTX_WEBRTC_URL` to the browser-reachable HTTPS URL for WHIP (normally `https://media.example.com:8889` behind a TLS reverse proxy).
+- `MEDIAMTX_WEBRTC_ALLOWED_ORIGINS` to the exact hosted frontend origin(s).
+- `MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS` to the public address advertised in WebRTC ICE candidates.
+- `MEDIA_SERVER_ALLOW_LOOPBACK=false`.
+
+Configure TLS on the WHIP signaling URL (the browser cannot use insecure HTTP from an HTTPS website), matching RTMPS/RTSPS listeners for OBS/provider as desired, advertise a reachable ICE host, and expose signaling TCP 8889 plus WebRTC UDP 8189 in the VM firewall. Clients behind restrictive NATs may also require a TURN server; no TURN service is provisioned by this app. Configure the provider agent's `UCMP_BACKEND_URL` and shared provider token to the same Render service. Any network firewall between browsers, providers, and the MediaMTX host must permit the selected ingest/read ports. Do not put destination keys in provider logs or dashboard telemetry; use encrypted signaling and RTMPS/RTSPS for production so stream credentials are encrypted on the network.
+
+No internet-hosted MediaMTX instance or DNS/TLS certificate is provisioned by the application. A real stream reaches STREAMING only after OBS sends actual media, FFmpeg receives and encodes it, and the destination accepts the output. Waiting for input is not billed; charges begin only after verified FFmpeg output progress. The input timeout is configurable with `STREAM_INPUT_TIMEOUT_SECONDS` (default 90 seconds).
+
+## Troubleshooting
+
+- “No compatible online provider” means the provider must be online, have the profile's CPU/RAM, report a current FFmpeg installation, and have at least one initialized H.264 encoder.
+- “Media ingest is not configured” means copy `.env.example` to `.env` and set both MediaMTX base URLs; startup logs and the session-start API explain which variable is missing or invalid. The backend intentionally refuses loopback addresses unless `MEDIA_SERVER_ALLOW_LOOPBACK=true` is explicitly enabled for a same-machine local demo.
+- For OBS/RTMP authentication, MediaMTX receives session credentials as `user`/`pass` query parameters. The URL format follows MediaMTX's documented RTMP authentication scheme; do not paste a destination platform key into OBS.
+- “Waiting for OBS input” means start OBS on the source device using the displayed server and session key. The provider process is already waiting for that input.
+- Browser Capture requires a secure browser context and a browser/media-network reachable WHIP address. `MEDIAMTX_WEBRTC_URL` must point to MediaMTX TCP 8889 (or a TLS reverse proxy), `MEDIAMTX_WEBRTC_ALLOWED_ORIGINS` must include the frontend origin, and WebRTC UDP 8189 plus correct ICE host advertisements must be reachable.
+- Destination authentication/network errors are summarized without returning FFmpeg's raw logs, stream keys, or credential-bearing URLs.
+
+## Verification limits
+
+Repository configuration and URL/path validation can be tested locally without a running media server. A successful API session allocation proves configuration syntax and provider eligibility only; it does not prove that a MediaMTX host is reachable from the user's OBS device or assigned provider. A real end-to-end verification still requires MediaMTX running, inbound firewall/DNS/TLS setup as applicable, a real OBS input, and an accepting destination platform.

@@ -6,7 +6,31 @@ services:
       DATABASE_URL: postgresql+psycopg://nexora:nexora@db:5432/nexora
       JWT_SECRET: ${JWT_SECRET:-change-me-before-production}
       PROVIDER_SHARED_TOKEN: ${PROVIDER_SHARED_TOKEN:-local-demo-token}
+      MEDIAMTX_INGEST_URL: ${MEDIAMTX_INGEST_URL:-rtmp://127.0.0.1:1935}
+      MEDIAMTX_PROVIDER_READ_URL: ${MEDIAMTX_PROVIDER_READ_URL:-rtsp://127.0.0.1:8554}
+      MEDIAMTX_WEBRTC_URL: ${MEDIAMTX_WEBRTC_URL:-http://127.0.0.1:8889}
+      MEDIA_SERVER_ALLOW_LOOPBACK: ${MEDIA_SERVER_ALLOW_LOOPBACK:-true}
     depends_on: [db]
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.2
+    restart: unless-stopped
+    environment:
+      MTX_AUTHMETHOD: http
+      MTX_AUTHHTTPADDRESS: http://backend:8000/stream/internal/mediamtx/auth
+      MTX_RTSPTRANSPORTS: tcp
+      MTX_WEBRTC: "yes"
+      MTX_WEBRTCADDRESS: :8889
+      MTX_WEBRTCLOCALUDPADDRESS: :8189
+      MTX_WEBRTCALLOWORIGINS: ${MEDIAMTX_WEBRTC_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_WEBRTC_ADDITIONAL_HOSTS:-127.0.0.1}
+    ports:
+      - "1935:1935/tcp"
+      - "8554:8554/tcp"
+      - "8889:8889/tcp"
+      - "8189:8189/udp"
+    volumes:
+      - ./infra/mediamtx.yml:/mediamtx.yml:ro
+    depends_on: [backend]
   db:
     image: postgres:16-alpine
     environment:

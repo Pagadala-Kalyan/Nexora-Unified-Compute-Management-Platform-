@@ -49,6 +49,70 @@ export function clearSession() {
   localStorage.removeItem('nexora_user');
 }
 
+function redactSensitiveConnectionDetails(message) {
+  return String(message)
+    .replace(/\brtmps?:\/\/[^\s"'`<>]+/gi, '[destination server]')
+    .replace(/\bnxt_live_[a-z0-9_-]+/gi, '[stream credential]')
+    .replace(/((?:stream|destination)\s*key|password|credential|token)\s*[:=]\s*[^,\s;]+/gi, '$1=[redacted]');
+}
+
+function messageFromDetail(detail) {
+  if (typeof detail === 'string') return detail.trim() === '[object Object]' ? '' : detail.trim();
+  if (Array.isArray(detail)) {
+    return detail.map((item) => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return '';
+      // Pydantic validation items may include the submitted `input`; never
+      // surface it because it could be a stream key or RTMP destination.
+      return typeof item.msg === 'string' ? item.msg : typeof item.message === 'string' ? item.message : '';
+    }).filter(Boolean).join('. ');
+  }
+  if (detail && typeof detail === 'object') {
+    if (typeof detail.message === 'string') return detail.message.trim();
+    if (typeof detail.msg === 'string') return detail.msg.trim();
+  }
+  return '';
+}
+
+/** Convert fetch/API errors into readable, non-sensitive text for the UI. */
+export function getErrorMessage(error, fallback = 'Something went wrong. Please try again.') {
+  if (typeof error === 'string') return redactSensitiveConnectionDetails(error.trim()) || fallback;
+
+  const payload = error?.payload ?? error?.response?.data ?? error?.data;
+  const detail = payload?.detail ?? error?.detail;
+  const detailMessage = messageFromDetail(detail);
+  const message = detailMessage || messageFromDetail(payload?.message) || messageFromDetail(payload?.error)
+    || messageFromDetail(error?.message)
+    || (typeof error?.message === 'string' && error.message !== '[object Object]' ? error.message.trim() : '');
+  const status = Number(error?.status ?? error?.response?.status);
+
+  if ((status === 402 || /insufficient token balance/i.test(message)) && /insufficient token balance/i.test(message)) {
+    const info = detail && typeof detail === 'object' && !Array.isArray(detail) ? detail : payload;
+    const required = Number(info?.required);
+    const available = Number(info?.available);
+    if (Number.isFinite(required) && Number.isFinite(available)) {
+      return `Not enough tokens to start this stream. The minimum reserve is ${required} tokens; your balance is ${available} tokens. Add tokens in Wallet & Billing and try again.`;
+    }
+    return 'There are not enough tokens to start this stream. Add tokens in Wallet & Billing and try again.';
+  }
+
+  if (/no compatible online provider with ffmpeg/i.test(message)) {
+    return 'No eligible online provider with FFmpeg is available for this stream. Connect a compatible provider and try again.';
+  }
+  if (/already have an active stream session/i.test(message)) {
+    return 'You already have an active stream session. Stop it before starting another one.';
+  }
+
+  return message ? redactSensitiveConnectionDetails(message) : fallback;
+}
+
+function createApiError(message, status, payload) {
+  const error = new Error(getErrorMessage({ message, status, payload }));
+  error.status = status;
+  error.payload = payload;
+  return error;
+}
+
 /**
  * Universal API Request Wrapper
  */
@@ -57,6 +121,12 @@ export async function apiRequest(path, options = {}) {
   const url = `${apiBase}${path.startsWith('/') ? path : '/' + path}`;
   
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+  // Callers may provide either pre-serialized JSON strings or plain objects.
+  // Fetch does not JSON-encode objects automatically; without this conversion
+  // FastAPI receives an invalid body and responds with a JSON decode error.
+  const requestBody = !isFormData && options.body && typeof options.body === 'object'
+    ? JSON.stringify(options.body)
+    : options.body;
   const headers = {
     ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
     ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
@@ -70,11 +140,13 @@ export async function apiRequest(path, options = {}) {
   try {
     response = await fetch(url, {
       ...options,
+      body: requestBody,
       headers,
       signal: controller.signal
     });
   } catch (err) {
     clearTimeout(timeoutId);
+    console.error('[API Fetch Error]', path, err);
     if (err.name === 'AbortError') {
       throw new Error(`Request timed out for endpoint ${path}`);
     }
@@ -93,13 +165,11 @@ export async function apiRequest(path, options = {}) {
       }));
     }
     
-    let errorDetail = 'Authentication required or invalid session';
+    let data = null;
     try {
-      const data = await response.json();
-      errorDetail = data.detail || errorDetail;
+      data = await response.json();
     } catch (_) {}
-    
-    throw new Error(typeof errorDetail === 'string' ? errorDetail : JSON.stringify(errorDetail));
+    throw createApiError('Authentication required or invalid session', response.status, data);
   }
 
   // Parse response
@@ -116,16 +186,8 @@ export async function apiRequest(path, options = {}) {
   }
 
   if (!response.ok) {
-    let message = 'Request failed';
-    if (data && typeof data === 'object') {
-      message = data.detail || data.message || JSON.stringify(data);
-    } else if (typeof data === 'string' && data.length > 0) {
-      message = data;
-    }
-    const err = new Error(message);
-    err.status = response.status;
-    err.payload = data;
-    throw err;
+    const message = typeof data === 'string' && data.length > 0 ? data : 'Request failed';
+    throw createApiError(message, response.status, data);
   }
 
   return data;
@@ -150,6 +212,10 @@ export async function createStreamSession(payload) {
 
 export async function getActiveStreamSession() {
   return apiRequest('/stream/sessions/active');
+}
+
+export async function getStreamSession(sessionId) {
+  return apiRequest(`/stream/sessions/${encodeURIComponent(sessionId)}`);
 }
 
 export async function stopStreamSession(sessionId) {

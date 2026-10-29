@@ -17,6 +17,7 @@ echo.
 echo  Environment overrides (optional):
 echo    PROVIDER_SHARED_TOKEN  Auth token  (default: local-demo-token)
 echo    COST_PER_HOUR          Billing rate (default: 0.15)
+echo    NEXORA_FFMPEG_PATH     Full path to ffmpeg.exe if it is not on PATH
 echo.
 echo ============================================================
 echo.

@@ -186,7 +186,7 @@ export function applyRealtimeEvent(event) {
   }
   if (event.type === 'stream.updated' && data.session) {
     const session = { ...(state.streamSession || {}), ...data.session };
-    state.streamSession = ['COMPLETED', 'FAILED'].includes(session.status) ? null : session;
+    state.streamSession = session.status === 'COMPLETED' ? null : session;
   }
   notify(event.type === 'telemetry.updated'
     ? 'telemetry'

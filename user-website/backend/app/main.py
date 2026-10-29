@@ -30,6 +30,72 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+# Load ignored local .env files for direct host runs. In containers, Compose (or
+# the deployment platform) is the source of configuration; never search the
+# container filesystem for a developer's host-side .env file.
+def _load_local_env_file(path: Path):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        if entry.startswith("export "):
+            entry = entry[7:].lstrip()
+        if "=" not in entry:
+            continue
+        name, value = entry.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(name, value)
+
+
+def _is_container_runtime() -> bool:
+    return (
+        os.getenv("NEXORA_IN_DOCKER", "").strip().lower() in ("1", "true", "yes")
+        or Path("/.dockerenv").is_file()
+        or os.getenv("container", "").strip().lower() in ("docker", "podman")
+    )
+
+
+def _local_env_file_paths(module_file: Path, *, in_container: bool = False) -> list[Path]:
+    """Return known host .env locations based on project markers and app layout."""
+    if in_container:
+        return []
+
+    app_directory = module_file.resolve().parent
+    backend_directory = app_directory.parent
+    paths: list[Path] = []
+
+    # Find the repository root by its checked-in example/config marker instead
+    # of assuming a fixed number of parents (which differs in Docker images).
+    repository_root = next(
+        (
+            ancestor
+            for ancestor in (backend_directory, *backend_directory.parents)
+            if (ancestor / ".env.example").is_file() or (ancestor / "docker-compose.yml").is_file()
+        ),
+        None,
+    )
+    if repository_root is not None:
+        paths.append(repository_root / ".env")
+
+    # The backend-local .env remains useful for direct backend development.
+    backend_env = backend_directory / ".env"
+    if backend_env not in paths:
+        paths.append(backend_env)
+    return paths
+
+
+if not _is_container_runtime():
+    for _local_env_path in _local_env_file_paths(Path(__file__)):
+        _load_local_env_file(_local_env_path)
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nexora.db")
 # Render provides PostgreSQL URLs without the explicit SQLAlchemy driver name.
 if DATABASE_URL.startswith("postgresql://"):
@@ -292,11 +358,13 @@ class StreamSessionCreate(BaseModel):
     destination_url: str
     destination_key: str
     profile: str = "720p60"
+    source_mode: str = "obs"
 
 class MediaMTXAuthPayload(BaseModel):
     ip: Optional[str] = None
     user: Optional[str] = None
     password: Optional[str] = None
+    token: Optional[str] = None
     path: Optional[str] = None
     protocol: Optional[str] = None
     id: Optional[str] = None
@@ -304,13 +372,20 @@ class MediaMTXAuthPayload(BaseModel):
     query: Optional[str] = None
 
 class StreamHeartbeatPayload(BaseModel):
-    status: str = "ENCODING"
+    provider_id: str
+    status: str = "STARTING"
     metrics: dict = Field(default_factory=dict)
     error: Optional[str] = None
 
 @asynccontextmanager
 async def app_lifespan(app):
     realtime_hub.loop = asyncio.get_running_loop()
+    try:
+        _validate_media_server_config()
+    except HTTPException as exc:
+        # The control plane remains usable for non-stream features, but say
+        # plainly why Live Stream Studio cannot allocate a session yet.
+        print(f"[STREAM CONFIGURATION] {exc.detail}")
     Base.metadata.create_all(engine)
     session = SessionLocal()
     try:
@@ -633,7 +708,7 @@ def compatible_provider(s, requirements, exclude_id=None):
         try:
             busy_stream_providers = {
                 row[0] for row in s.query(StreamSession.provider_id)
-                .filter(StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING"]))
+                .filter(StreamSession.status.in_(STREAM_ACTIVE_STATUSES))
                 .all() if row[0]
             }
         except Exception:
@@ -649,11 +724,35 @@ def compatible_provider(s, requirements, exclude_id=None):
             continue
         if workload in ("video_compress", "remote_stream_encode") and not (p.system_info or {}).get("ffmpeg_available"):
             continue
+        if workload == "remote_stream_encode" and not _provider_stream_encoder(p):
+            continue
         if workload == "remote_stream_encode" and p.id in busy_stream_providers:
             continue
         candidates.append(p)
 
     return min(candidates, key=lambda x: x.cost_per_hour / (max(x.reliability, 1) / 100)) if candidates else None
+
+def stream_provider_unavailable_reason(s, requirements):
+    """Explain which real readiness check prevents stream provider assignment."""
+    online = [p for p in s.query(Provider).all() if p.status in ("ONLINE", "AVAILABLE")]
+    if not online:
+        return "No provider is currently online. Start the provider agent and wait for its heartbeat to appear in Fleet Providers."
+    capable_resources = [p for p in online if p.cpu_cores >= requirements["cpu_cores"] and p.ram_gb >= requirements["ram_gb"]]
+    if not capable_resources:
+        return "Online providers do not meet this encoding profile's CPU and memory requirements. Choose a lighter profile or connect a larger provider."
+    ffmpeg_providers = [p for p in capable_resources if (p.system_info or {}).get("ffmpeg_available")]
+    if not ffmpeg_providers:
+        return "No eligible online provider reports FFmpeg. Install or configure FFmpeg on the provider PC, then restart its agent."
+    encoder_providers = [p for p in ffmpeg_providers if _provider_stream_encoder(p)]
+    if not encoder_providers:
+        return "No eligible online provider reports a working H.264 encoder. Use an FFmpeg build with libx264 or a usable hardware encoder, then restart its agent."
+    busy = {
+        row[0] for row in s.query(StreamSession.provider_id)
+        .filter(StreamSession.status.in_(STREAM_ACTIVE_STATUSES)).all() if row[0]
+    }
+    if all(p.id in busy for p in encoder_providers):
+        return "All compatible online providers are already running a stream. Stop one or connect another provider."
+    return "No compatible online provider is available. Check Fleet Providers for current status and heartbeat."
 def recover_lost_providers(stop_event: Optional[threading.Event] = None):
     """Detect provider loss and re-dispatch checkpointed controlled workloads with generation fencing."""
     stop_event = stop_event or threading.Event()
@@ -669,14 +768,19 @@ def recover_lost_providers(stop_event: Optional[threading.Event] = None):
                 provider_events.append(failed)
                 # Handle lost stream sessions on this provider
                 try:
-                    for stream in s.query(StreamSession).filter(StreamSession.provider_id==failed.id, StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])).all():
+                    for stream in s.query(StreamSession).filter(StreamSession.provider_id==failed.id, StreamSession.status.in_(STREAM_ACTIVE_STATUSES)).all():
                         stream.status = "FAILED"
                         stream.error_message = f"Provider {failed.name} disconnected unexpectedly."
                         stream.completed_at = now
+                        stream.publish_key = ""
+                        stream.read_key = ""
+                        stream.destination_key_encrypted = ""
                         stream_events.append(stream)
                         add_audit(s, "stream.provider_lost", user_id=stream.user_id, provider_id=failed.id, details={"session_id": stream.id})
                 except Exception as sex:
-                    print(f"[RECOVERY MONITOR STREAM ERROR] {sex}")
+                    # Keep credentials, destination URLs, and exception payloads
+                    # out of application logs.
+                    print(f"[RECOVERY MONITOR STREAM ERROR] {type(sex).__name__}")
                 for j in s.query(Job).filter(Job.provider_id==failed.id,Job.status.in_(["SCHEDULED","RUNNING"])).all():
                     checkpoint=s.query(Checkpoint).filter_by(job_id=j.id).order_by(Checkpoint.seq.desc(), Checkpoint.created_at.desc()).first()
                     replacement=compatible_provider(s,j.requirements,failed.id)
@@ -746,6 +850,19 @@ def ensure_schema_columns(s):
                 for col_name, col_def in cols:
                     if col_name not in existing:
                         s.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}"))
+
+            # Ensure job_artifacts.job_id is nullable in legacy SQLite databases
+            art_tbl = s.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='job_artifacts'")).fetchone()
+            if art_tbl:
+                art_cols = s.execute(text("PRAGMA table_info(job_artifacts)")).fetchall()
+                job_id_col = next((c for c in art_cols if c[1] == "job_id"), None)
+                if job_id_col and job_id_col[3] == 1:
+                    s.execute(text("DROP TABLE IF EXISTS _job_artifacts_mig"))
+                    s.execute(text("CREATE TABLE _job_artifacts_mig AS SELECT * FROM job_artifacts"))
+                    s.execute(text("DROP TABLE job_artifacts"))
+                    Base.metadata.tables["job_artifacts"].create(bind)
+                    s.execute(text("INSERT INTO job_artifacts SELECT * FROM _job_artifacts_mig"))
+                    s.execute(text("DROP TABLE _job_artifacts_mig"))
             s.commit()
     except Exception as ex:
         print(f"[SCHEMA MIGRATION WARNING] {ex}")
@@ -1276,8 +1393,58 @@ async def provider_upload_artifact(job_id: str, file: UploadFile = File(...), ar
 # REMOTE STREAM ENCODING ENDPOINTS
 # ============================================================
 
-MEDIAMTX_INGEST_URL = os.getenv("MEDIAMTX_INGEST_URL", "rtmp://127.0.0.1:1935")
-MEDIAMTX_INTERNAL_URL = os.getenv("MEDIAMTX_INTERNAL_URL", "rtsp://127.0.0.1:8554")
+MEDIAMTX_INGEST_URL = os.getenv("MEDIAMTX_INGEST_URL", "").strip().rstrip("/")
+MEDIAMTX_PROVIDER_READ_URL = os.getenv("MEDIAMTX_PROVIDER_READ_URL", os.getenv("MEDIAMTX_INTERNAL_URL", "")).strip().rstrip("/")
+MEDIAMTX_WEBRTC_URL = os.getenv("MEDIAMTX_WEBRTC_URL", "http://127.0.0.1:8889").strip().rstrip("/")
+MEDIA_SERVER_ALLOW_LOOPBACK = os.getenv("MEDIA_SERVER_ALLOW_LOOPBACK", "false").lower() in ("1", "true", "yes")
+STREAM_ACTIVE_STATUSES = ("CREATED", "ALLOCATED", "STARTING", "WAITING_FOR_INPUT", "INGESTING", "RECEIVING", "ENCODING", "STREAMING", "STOPPING")
+STREAM_TERMINAL_STATUSES = ("STOPPED", "COMPLETED", "FAILED")
+
+def _validate_media_server_config():
+    for label, value in (("MEDIAMTX_INGEST_URL", MEDIAMTX_INGEST_URL), ("MEDIAMTX_PROVIDER_READ_URL", MEDIAMTX_PROVIDER_READ_URL)):
+        if not value:
+            raise HTTPException(503, f"Media ingest is not configured: set {label} to the reachable MediaMTX base address")
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise HTTPException(503, f"Media ingest configuration {label} is not a valid URL")
+        expected_schemes = ("rtmp", "rtmps") if label == "MEDIAMTX_INGEST_URL" else ("rtsp", "rtsps")
+        if not parsed.scheme or not hostname or parsed.scheme.lower() not in expected_schemes:
+            protocols = "RTMP(S)" if label == "MEDIAMTX_INGEST_URL" else "RTSP(S)"
+            raise HTTPException(503, f"Media ingest configuration {label} must be a {protocols} base URL with a hostname")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+            raise HTTPException(503, f"Media ingest configuration {label} must contain only the protocol, host, and optional port; session credentials and paths are generated by Nexora")
+        if port is not None and not 1 <= port <= 65535:
+            raise HTTPException(503, f"Media ingest configuration {label} has an invalid port")
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = hostname.lower() == "localhost"
+        if loopback and not MEDIA_SERVER_ALLOW_LOOPBACK:
+            raise HTTPException(503, f"Media ingest configuration {label} uses loopback, which other devices cannot reach; configure the MediaMTX LAN/public address")
+
+def _validate_webrtc_publish_url():
+    try:
+        parsed = urllib.parse.urlsplit(MEDIAMTX_WEBRTC_URL)
+        _ = parsed.port
+    except ValueError:
+        raise HTTPException(503, "Browser capture configuration MEDIAMTX_WEBRTC_URL is not a valid URL")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HTTPException(503, "Browser capture requires MEDIAMTX_WEBRTC_URL to be an HTTP(S) base URL without credentials or query parameters")
+
+def _provider_stream_encoder(provider: Provider):
+    info = provider.system_info or {}
+    available = info.get("stream_encoders") or []
+    if "h264_nvenc" in available and (info.get("cuda_available") or "nvidia" in (provider.gpu_name or "").lower()):
+        return "h264_nvenc"
+    gpu_name = (provider.gpu_name or "").lower()
+    if "h264_qsv" in available and "intel" in gpu_name:
+        return "h264_qsv"
+    if "h264_amf" in available and ("amd" in gpu_name or "radeon" in gpu_name):
+        return "h264_amf"
+    return "libx264" if "libx264" in available else None
 
 def stream_session_data(session: StreamSession, include_keys: bool = False, provider_name: Optional[str] = None):
     data = {
@@ -1298,11 +1465,19 @@ def stream_session_data(session: StreamSession, include_keys: bool = False, prov
         "created_at": session.created_at,
         "started_at": session.started_at,
         "completed_at": session.completed_at,
-        "ingest_server": f"{MEDIAMTX_INGEST_URL}/live",
+        "ingest_server": f"{MEDIAMTX_INGEST_URL}/live" if MEDIAMTX_INGEST_URL else None,
+        "ingest_path": f"live/{session.id}",
+        "source_mode": (session.encoding_config or {}).get("source_mode", "obs"),
     }
+    if data["source_mode"] == "browser_capture":
+        data["webrtc_publish_url"] = f"{MEDIAMTX_WEBRTC_URL}/{session.ingest_path}/whip" if MEDIAMTX_WEBRTC_URL else None
     if include_keys:
-        data["stream_key"] = f"{session.id}?key={session.publish_key}"
-        data["publish_key"] = session.publish_key
+        if data["source_mode"] == "browser_capture":
+            # WHIP carries session credentials in Basic auth, never the URL.
+            data["browser_publish_credential"] = {"username": "nexora", "password": session.publish_key}
+        else:
+            # RTMP clients carry credentials as user/pass query parameters.
+            data["stream_key"] = f"{session.id}?{urllib.parse.urlencode({'user': 'nexora', 'pass': session.publish_key})}"
     return data
 
 def publish_stream_update(s: Session, session: StreamSession):
@@ -1319,9 +1494,19 @@ def publish_stream_update(s: Session, session: StreamSession):
 
 @app.post("/stream/sessions")
 def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_user), s: Session = Depends(db)):
+    _validate_media_server_config()
+    if body.source_mode not in ("obs", "browser_capture"):
+        raise HTTPException(422, "Choose OBS or Browser Capture as the stream input")
+    if body.source_mode == "browser_capture":
+        _validate_webrtc_publish_url()
+    if body.destination_platform not in ("youtube", "twitch", "custom_rtmp"):
+        raise HTTPException(422, "Choose a supported stream destination platform")
+    if body.profile not in STREAM_PROFILES:
+        raise HTTPException(422, "Choose a supported stream encoding profile")
+
     active = s.query(StreamSession).filter(
         StreamSession.user_id == u.id,
-        StreamSession.status.in_(["CREATED", "ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])
+        StreamSession.status.in_(STREAM_ACTIVE_STATUSES)
     ).first()
     if active:
         raise HTTPException(409, f"You already have an active stream session ({active.id}). Stop it before starting a new one.")
@@ -1334,10 +1519,15 @@ def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_u
             "available": wallet.token_balance
         })
 
-    profile_key = body.profile if body.profile in STREAM_PROFILES else "720p60"
+    profile_key = body.profile
     profile_cfg = STREAM_PROFILES[profile_key]
 
     dest_url, dest_key, masked_key = validate_destination_target(body.destination_url, body.destination_key)
+    destination_host = urllib.parse.urlsplit(dest_url).hostname.lower()
+    if body.destination_platform == "youtube" and not (destination_host == "youtube.com" or destination_host.endswith(".youtube.com")):
+        raise HTTPException(422, "The YouTube destination must use a youtube.com ingest host")
+    if body.destination_platform == "twitch" and not (destination_host == "twitch.tv" or destination_host.endswith(".twitch.tv")):
+        raise HTTPException(422, "The Twitch destination must use a twitch.tv ingest host")
 
     reqs = {
         "workload": "remote_stream_encode",
@@ -1346,7 +1536,10 @@ def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_u
     }
     p = compatible_provider(s, reqs)
     if not p:
-        raise HTTPException(409, "No compatible online provider with FFmpeg is currently available for stream encoding.")
+        raise HTTPException(409, stream_provider_unavailable_reason(s, reqs))
+    selected_encoder = _provider_stream_encoder(p)
+    if not selected_encoder:
+        raise HTTPException(409, "The selected provider does not report a usable H.264 encoder. Install an FFmpeg build with libx264 or a supported hardware encoder and restart the provider agent.")
 
     session_id = f"stream_{secrets.token_hex(6)}"
     publish_key = f"nxt_live_{secrets.token_hex(12)}"
@@ -1368,10 +1561,10 @@ def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_u
         destination_key_masked=masked_key,
         destination_key_encrypted=enc_dest_key,
         profile_name=profile_key,
-        encoding_config=profile_cfg,
+        encoding_config={**profile_cfg, "video_encoder": selected_encoder, "source_mode": body.source_mode},
         tokens_per_minute=profile_cfg.get("tokens_per_minute", 2),
         total_tokens_billed=0,
-        latest_metrics={"status": "waiting_for_obs", "fps": 0, "bitrate_kbps": 0}
+        latest_metrics={"status": "ALLOCATED"}
     )
     s.add(session)
     add_audit(s, "stream.created", user_id=u.id, provider_id=p.id, details={"session_id": session_id, "profile": profile_key})
@@ -1384,7 +1577,7 @@ def create_stream_session(body: StreamSessionCreate, u: User = Depends(current_u
 def get_active_stream_session(u: User = Depends(current_user), s: Session = Depends(db)):
     session = s.query(StreamSession).filter(
         StreamSession.user_id == u.id,
-        StreamSession.status.in_(["CREATED", "ALLOCATED", "INGESTING", "ENCODING", "STOPPING"])
+        StreamSession.status.in_(STREAM_ACTIVE_STATUSES)
     ).order_by(StreamSession.created_at.desc()).first()
     if not session:
         return {"active": False, "session": None}
@@ -1401,13 +1594,24 @@ def get_stream_session(session_id: str, u: User = Depends(current_user), s: Sess
 
 @app.post("/stream/sessions/{session_id}/stop")
 def stop_stream_session(session_id: str, u: User = Depends(current_user), s: Session = Depends(db)):
-    session = s.get(StreamSession, session_id)
+    session = s.query(StreamSession).filter(StreamSession.id == session_id).with_for_update().first()
     if not session or session.user_id != u.id:
         raise HTTPException(404, "Stream session not found")
-    if session.status in ("COMPLETED", "FAILED"):
+    if session.status in STREAM_TERMINAL_STATUSES:
         return stream_session_data(session)
 
-    session.status = "STOPPING"
+    if session.status in ("ALLOCATED", "RECEIVING"):
+        # No provider process was claimed yet, so there is nothing to signal or wait for.
+        session.status = "STOPPED"
+        session.completed_at = datetime.now(timezone.utc)
+        session.publish_key = ""
+        session.read_key = ""
+        session.destination_key_encrypted = ""
+        provider = s.get(Provider, session.provider_id) if session.provider_id else None
+        if provider:
+            provider.status = "ONLINE"
+    else:
+        session.status = "STOPPING"
     add_audit(s, "stream.stop_requested", user_id=u.id, provider_id=session.provider_id, details={"session_id": session_id})
     s.commit()
     publish_stream_update(s, session)
@@ -1422,24 +1626,38 @@ def mediamtx_auth(body: MediaMTXAuthPayload, s: Session = Depends(db)):
     key = body.password
     if not key and body.query:
         qs = urllib.parse.parse_qs(body.query)
-        if "key" in qs:
-            key = qs["key"][0]
+        key = (qs.get("key") or qs.get("pass") or [None])[0]
 
     session = s.get(StreamSession, session_id)
-    if not session or session.status in ("COMPLETED", "FAILED"):
+    if not session or path != f"live/{session.id}" or session.status in STREAM_TERMINAL_STATUSES or session.status == "STOPPING":
         raise HTTPException(401, "Invalid session or session not active")
+    # RTSP token clients normally have no username; MediaMTX documents empty
+    # user/password fields for these requests. Publish still uses the Nexora
+    # username in its separate RTMP credential flow.
+    if body.user not in (None, "", "nexora"):
+        raise HTTPException(401, "Invalid session credentials")
 
     if body.action == "publish":
+        if body.user not in (None, "nexora"):
+            raise HTTPException(401, "Invalid publish credentials")
+        source_mode = (session.encoding_config or {}).get("source_mode", "obs")
+        expected_protocol = "webrtc" if source_mode == "browser_capture" else "rtmp"
+        if (body.protocol or "").lower() != expected_protocol:
+            raise HTTPException(401, "Invalid publish protocol for this stream session")
         if not key or not secrets.compare_digest(key, session.publish_key):
             raise HTTPException(401, "Invalid publish stream key")
-        if session.status == "ALLOCATED":
-            session.status = "INGESTING"
+        if session.status in ("ALLOCATED", "STARTING", "WAITING_FOR_INPUT"):
+            session.status = "RECEIVING"
             s.commit()
             publish_stream_update(s, session)
         return {"status": "ok", "action": "publish"}
 
     elif body.action == "read":
-        if not key or not secrets.compare_digest(key, session.read_key):
+        # MediaMTX's RTSP token authentication sends the URL's `token` query
+        # parameter as the dedicated `token` field in its HTTP auth webhook.
+        if body.protocol != "rtsp":
+            raise HTTPException(401, "Invalid read protocol")
+        if not body.token or not secrets.compare_digest(body.token, session.read_key):
             raise HTTPException(401, "Invalid read key")
         return {"status": "ok", "action": "read"}
 
@@ -1447,55 +1665,95 @@ def mediamtx_auth(body: MediaMTXAuthPayload, s: Session = Depends(db)):
 
 @app.get("/providers/{provider_id}/streams/pending")
 def provider_pending_streams(provider_id: str, _ = Depends(provider_auth), s: Session = Depends(db)):
-    sessions = s.query(StreamSession).filter(
+    # Kept as a compatibility endpoint, but never returns session credentials.
+    return []
+
+@app.post("/providers/{provider_id}/streams/claim")
+def provider_claim_stream(provider_id: str, _ = Depends(provider_auth), s: Session = Depends(db)):
+    provider = s.get(Provider, provider_id)
+    if not provider:
+        raise HTTPException(404, "Provider not found")
+    if provider.status not in ("ONLINE", "BUSY"):
+        return {"command": "NONE"}
+    sess = s.query(StreamSession).filter(
         StreamSession.provider_id == provider_id,
-        StreamSession.status.in_(["ALLOCATED", "INGESTING", "ENCODING"])
-    ).all()
-    results = []
-    for sess in sessions:
-        try:
-            plain_dest_key = decrypt_secret(sess.destination_key_encrypted)
-        except Exception:
-            plain_dest_key = ""
-        results.append({
-            "session_id": sess.id,
-            "status": sess.status,
-            "source_url": f"{MEDIAMTX_INTERNAL_URL}/live/{sess.id}?key={sess.read_key}",
-            "destination_url": sess.destination_url,
-            "destination_key": plain_dest_key,
-            "profile_name": sess.profile_name,
-            "encoding_config": sess.encoding_config or {},
-            "tokens_per_minute": sess.tokens_per_minute
-        })
-    return results
+        StreamSession.status.in_(["ALLOCATED", "RECEIVING"]),
+    ).order_by(StreamSession.created_at.asc()).with_for_update().first()
+    if not sess:
+        return {"command": "NONE"}
+    sess.status = "STARTING"
+    sess.latest_metrics = {"status": "STARTING"}
+    s.commit()
+    publish_stream_update(s, sess)
+    try:
+        plain_dest_key = decrypt_secret(sess.destination_key_encrypted)
+    except Exception:
+        sess.status = "FAILED"
+        sess.error_message = "Destination credentials could not be decrypted. Re-enter the stream key and retry."
+        sess.completed_at = datetime.now(timezone.utc)
+        sess.publish_key = ""
+        sess.read_key = ""
+        sess.destination_key_encrypted = ""
+        provider.status = "ONLINE"
+        s.commit()
+        publish_stream_update(s, sess)
+        return {"command": "NONE"}
+    if not MEDIAMTX_PROVIDER_READ_URL:
+        sess.status = "FAILED"
+        sess.error_message = "MediaMTX provider read address is not configured."
+        sess.completed_at = datetime.now(timezone.utc)
+        sess.publish_key = ""
+        sess.read_key = ""
+        sess.destination_key_encrypted = ""
+        provider.status = "ONLINE"
+        s.commit()
+        publish_stream_update(s, sess)
+        raise HTTPException(503, "MediaMTX provider read address is not configured")
+    return {"command": "START_STREAM", "session": {
+        "session_id": sess.id,
+        "provider_id": provider_id,
+        "source_url": f"{MEDIAMTX_PROVIDER_READ_URL}/live/{sess.id}?{urllib.parse.urlencode({'token': sess.read_key})}",
+        "destination_url": sess.destination_url,
+        "destination_key": plain_dest_key,
+        "profile_name": sess.profile_name,
+        "encoding_config": sess.encoding_config or {},
+    }}
 
 @app.post("/providers/streams/{session_id}/heartbeat")
 def provider_stream_heartbeat(session_id: str, body: StreamHeartbeatPayload, _ = Depends(provider_auth), s: Session = Depends(db)):
-    sess = s.get(StreamSession, session_id)
+    sess = s.query(StreamSession).filter(StreamSession.id == session_id).with_for_update().first()
     if not sess:
         raise HTTPException(404, "Stream session not found")
+    if sess.provider_id != body.provider_id:
+        raise HTTPException(403, "Stream session is assigned to another provider")
 
     now = datetime.now(timezone.utc)
     if sess.status == "STOPPING":
-        return {"action": "stop", "reason": "user_cancelled"}
+        return {"command": "STOP_STREAM", "action": "stop", "reason": "user_cancelled"}
 
-    if sess.status in ("COMPLETED", "FAILED"):
-        return {"action": "stop", "reason": "session_terminated"}
+    if sess.status in STREAM_TERMINAL_STATUSES:
+        return {"command": "STOP_STREAM", "action": "stop", "reason": "session_terminated"}
 
-    if sess.status in ("ALLOCATED", "INGESTING"):
-        sess.status = "ENCODING"
-    if not sess.started_at:
-        sess.started_at = now
+    valid_statuses = {"STARTING", "WAITING_FOR_INPUT", "RECEIVING", "ENCODING", "STREAMING"}
+    if body.status not in valid_statuses:
+        raise HTTPException(422, "Invalid stream process status")
+    sess.status = body.status
+    sess.latest_metrics = {**(body.metrics or {}), "status": body.status}
+
+    if body.status != "STREAMING" and sess.started_at and sess.last_billed_at:
+        # Pause billable runtime while source/destination is not verified as streaming.
         sess.last_billed_at = now
-
-    sess.latest_metrics = body.metrics or {}
 
     wallet = wallet_for(s, sess.user_id)
     last_bill = sess.last_billed_at if (sess.last_billed_at and sess.last_billed_at.tzinfo) else (sess.last_billed_at.replace(tzinfo=timezone.utc) if sess.last_billed_at else now)
     elapsed_since_bill = (now - last_bill).total_seconds()
     balance_changed = False
 
-    if elapsed_since_bill >= 60:
+    # Waiting for OBS/input, encoder initialization, and failed destination attempts are not billable.
+    if body.status == "STREAMING" and sess.started_at is None:
+        sess.started_at = now
+        sess.last_billed_at = now
+    if body.status == "STREAMING" and elapsed_since_bill >= 60:
         minutes_to_bill = int(elapsed_since_bill // 60)
         tokens_due = minutes_to_bill * sess.tokens_per_minute
 
@@ -1509,7 +1767,7 @@ def provider_stream_heartbeat(session_id: str, body: StreamHeartbeatPayload, _ =
             s.commit()
             publish_stream_update(s, sess)
             realtime_hub.publish_from_sync("billing.updated", billing_event_data(s, sess.user_id), topic="billing", user_id=sess.user_id)
-            return {"action": "stop", "reason": "insufficient_tokens"}
+            return {"command": "STOP_STREAM", "action": "stop", "reason": "insufficient_tokens"}
         else:
             token_ledger(s, wallet, "STREAM_USAGE", -tokens_due, "STREAM", sess.id, f"Stream compute minute for {sess.id}", sess.id)
             sess.total_tokens_billed += tokens_due
@@ -1525,26 +1783,37 @@ def provider_stream_heartbeat(session_id: str, body: StreamHeartbeatPayload, _ =
 
 @app.post("/providers/streams/{session_id}/stopped")
 def provider_stream_stopped(session_id: str, body: StreamHeartbeatPayload, _ = Depends(provider_auth), s: Session = Depends(db)):
-    sess = s.get(StreamSession, session_id)
+    sess = s.query(StreamSession).filter(StreamSession.id == session_id).with_for_update().first()
     if not sess:
         raise HTTPException(404, "Stream session not found")
+    if sess.provider_id != body.provider_id:
+        raise HTTPException(403, "Stream session is assigned to another provider")
+    if sess.status in STREAM_TERMINAL_STATUSES:
+        return {"ok": True, "status": sess.status}
 
     now = datetime.now(timezone.utc)
     sess.completed_at = now
     if body.error:
         sess.status = "FAILED"
-        sess.error_message = body.error
+        safe_error = str(body.error).strip()
+        # Provider reports are untrusted; never persist a URL, credential, or raw FFmpeg output.
+        sess.error_message = safe_error[:240] if not re.search(r"(?i)(rtmps?://|rtsps?://|key=|stream.?key|password)", safe_error) else "The provider could not complete stream encoding. Check the source and destination configuration."
     else:
-        sess.status = "COMPLETED"
+        sess.status = "STOPPED" if sess.status == "STOPPING" else "COMPLETED"
 
     if body.metrics:
         sess.latest_metrics = body.metrics
+
+    # Credentials are session-scoped. Revoke them as soon as the process is finalized.
+    sess.publish_key = ""
+    sess.read_key = ""
+    sess.destination_key_encrypted = ""
 
     p = s.get(Provider, sess.provider_id)
     if p:
         p.status = "ONLINE"
 
-    add_audit(s, "stream.completed", user_id=sess.user_id, provider_id=sess.provider_id, details={
+    add_audit(s, "stream.ended", user_id=sess.user_id, provider_id=sess.provider_id, details={
         "session_id": session_id,
         "status": sess.status,
         "total_tokens_billed": sess.total_tokens_billed,

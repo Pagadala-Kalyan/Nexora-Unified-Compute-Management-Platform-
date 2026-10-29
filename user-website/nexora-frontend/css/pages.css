@@ -766,6 +766,23 @@
   line-height: 1.5;
 }
 
+.browser-capture-preview {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 360px;
+  object-fit: contain;
+  background: #080710;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+}
+
+.browser-capture-actions {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
 .form-row-2 {
   display: grid;
   grid-template-columns: 1fr 1fr;

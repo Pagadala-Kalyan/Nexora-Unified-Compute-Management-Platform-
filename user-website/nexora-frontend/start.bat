@@ -51,9 +51,9 @@ if not defined PYTHON (
 REM ─── Optional: show whether local backend appears reachable ──────────────────
 echo [INFO] Checking for local backend at http://127.0.0.1:8000 ...
 curl --silent --max-time 3 --head http://127.0.0.1:8000/health >nul 2>&1
-if !errorlevel!==0 (
-    echo [INFO] Local backend not detected — frontend will use the cloud backend.
-    echo [INFO] To use local mode, start user-website\backend\start.bat first.
+if errorlevel 1 (
+    echo [WARNING] Local backend not detected. Sign-in and API features will fail until it is running.
+    echo [INFO] Start user-website\backend\start.bat, or open the deployed site / use ?controlPlane=URL.
 ) else (
     echo [OK]   Local backend is reachable — frontend will connect to 127.0.0.1:8000
 )

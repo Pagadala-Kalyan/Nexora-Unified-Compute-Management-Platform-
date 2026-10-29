@@ -68,6 +68,10 @@ if not !errorlevel!==0 (
 )
 
 REM ─── Environment ─────────────────────────────────────────────────────────────
+REM  Copy the repository's .env.example to .env and configure MediaMTX URLs.
+REM  main.py loads that ignored .env automatically for this direct local run.
+REM  MEDIAMTX_INGEST_URL and MEDIAMTX_PROVIDER_READ_URL must point to the
+REM  MediaMTX host reachable from the OBS source device and provider PC.
 REM  PROVIDER_SHARED_TOKEN must match the token used by providers.
 REM  "local-demo-token" is accepted by the backend as a built-in fallback.
 if not defined PROVIDER_SHARED_TOKEN (
@@ -79,14 +83,14 @@ if not defined SECRET_KEY (
     set "SECRET_KEY=dev-secret-key-change-in-production"
 )
 
-echo [ENV]    PROVIDER_SHARED_TOKEN = %PROVIDER_SHARED_TOKEN%
-echo [ENV]    SECRET_KEY            = (set)
+echo [ENV]    Provider authentication token is configured (value hidden).
+echo [ENV]    SECRET_KEY            = (set; value hidden)
 echo.
 echo [START]  http://127.0.0.1:8000
 echo [DOCS]   http://127.0.0.1:8000/docs
 echo.
 
-"%PYTHON%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+"%PYTHON%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir app
 
 echo.
 echo ============================================================
