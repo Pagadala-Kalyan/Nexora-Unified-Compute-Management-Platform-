@@ -643,12 +643,15 @@ async function startBrowserCapture(session) {
     }
     renderActiveSession(document.getElementById('stream-studio-content'), currentSession || session);
 
+    // For simulation mode, always start telemetry for the preview UI.
+    // Then try to push the canvas stream over WHIP so the provider's FFmpeg
+    // can read it via RTSP — this makes the simulation truly end-to-end.
     if (mode === 'browser_simulation') {
       startSimulationTelemetry();
-      showToast('Simulated broadcast pattern is active in preview.', 'success');
-      return;
+      showToast('Simulated broadcast pattern active — connecting to Nexora ingest…', 'info');
     }
 
+    // All browser modes push via WebRTC WHIP (camera, screen capture, simulation).
     try {
       const { username, password } = browserPublishCredential(session);
       const publisher = await startWhipPublisher({
@@ -663,12 +666,19 @@ async function startBrowserCapture(session) {
       }
       browserWhipPublisher = publisher;
       const status = document.getElementById('browser-capture-status');
-      if (status) status.textContent = 'Browser media transport connected. Nexora is broadcasting live stream.';
-      showToast('Live stream connected to Nexora ingest over WebRTC WHIP.', 'success');
+      if (mode === 'browser_simulation') {
+        if (status) status.textContent = 'Simulated stream publishing to Nexora ingest over WebRTC WHIP.';
+        showToast('Simulated live stream connected to Nexora ingest.', 'success');
+      } else {
+        if (status) status.textContent = 'Browser media transport connected. Nexora is broadcasting live stream.';
+        showToast('Live stream connected to Nexora ingest over WebRTC WHIP.', 'success');
+      }
     } catch (whipErr) {
       console.warn('[WHIP Transport Warning]', whipErr);
-      startSimulationTelemetry();
-      showToast(`Live camera preview active. (Remote WHIP: ${whipErr.message})`, 'info');
+      if (mode !== 'browser_simulation') {
+        startSimulationTelemetry();
+      }
+      showToast(`Preview active. (Remote WHIP: ${whipErr.message})`, 'info');
     }
     renderActiveSession(document.getElementById('stream-studio-content'), currentSession || session);
   } catch (error) {

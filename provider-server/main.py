@@ -1357,7 +1357,7 @@ def run_stream_encoder(stream_data, stop_event, retry_attempt=0, input_deadline=
     metrics = {"status": "STARTING"}
     status_value = ["STARTING"]
     started = time.monotonic()
-    input_timeout = max(1, int(os.getenv("STREAM_INPUT_TIMEOUT_SECONDS", "90")))
+    input_timeout = max(1, int(os.getenv("STREAM_INPUT_TIMEOUT_SECONDS", "180")))
     # A provider can claim a session before OBS or Browser Capture has started
     # publishing. Keep the session and its short-lived ingest credential valid
     # through this entire initial-input window, even when RTSP DESCRIBE returns
@@ -1570,6 +1570,23 @@ def run_stream_encoder(stream_data, stop_event, retry_attempt=0, input_deadline=
             and any(term in failure_text for term in ("connection refused", "connection timed out", "network is unreachable", "could not resolve", "end of file"))
             and not any(term in failure_text for term in ("401", "403", "unauthorized", "invalid stream key", "input timeout"))
         )
+        # For browser-based input modes (camera, simulation, screen capture),
+        # RTSP 401/403 errors that occur before any input was detected are
+        # transient: they indicate MediaMTX has not yet relayed the WebRTC WHIP
+        # stream to RTSP. Treat these as "waiting for publisher" so we retry
+        # instead of failing immediately.
+        source_mode = (stream_data.get("encoding_config") or {}).get("source_mode", "obs")
+        browser_modes = ("browser_capture", "browser_camera", "browser_simulation")
+        is_browser_mode = source_mode in browser_modes
+        browser_auth_pending = (
+            is_browser_mode
+            and not input_seen
+            and not saw_progress
+            and final_status == "FAILED"
+            and time.monotonic() < input_deadline
+            and any(term in failure_text for term in ("401", "403", "unauthorized", "not found", "404", "end of file", "connection refused"))
+            and not any(term in failure_text for term in ("encoder", "cuda", "nvenc", "qsv", "amf", "no capable devices", "input timeout"))
+        )
         waiting_for_publisher = (
             final_status == "FAILED" and not input_seen and not saw_progress
             and time.monotonic() < input_deadline
@@ -1582,12 +1599,19 @@ def run_stream_encoder(stream_data, stop_event, retry_attempt=0, input_deadline=
                 "encoder", "cuda", "nvenc", "qsv", "amf", "no capable devices",
             ))
         )
+        # browser_auth_pending supersedes normal waiting_for_publisher check
+        if browser_auth_pending:
+            waiting_for_publisher = True
         if not stop_event.is_set() and (software_fallback or transient_network or waiting_for_publisher):
             if software_fallback:
                 print(f"[STREAM] Hardware encoder {selected_encoder} failed to initialize; retrying with libx264.")
                 stream_data["encoding_config"]["video_encoder"] = "libx264"
             elif waiting_for_publisher:
-                print("[STREAM] Ingest is not publishing yet; keeping the assigned session available while waiting for source media.")
+                if browser_auth_pending:
+                    remaining = max(0, int(input_deadline - time.monotonic()))
+                    print(f"[STREAM] Browser/WebRTC stream not yet relayed to RTSP — waiting for WHIP publish to complete ({remaining}s remaining).")
+                else:
+                    print("[STREAM] Ingest is not publishing yet; keeping the assigned session available while waiting for source media.")
             else:
                 print(f"[STREAM] Media connection interrupted; reconnect attempt {retry_attempt + 1} of 2.")
             retrying = True
@@ -1958,6 +1982,25 @@ def listener():
                         stream_data = command.get("session") if command.get("command") == "START_STREAM" else None
                         if stream_data and stream_data.get("provider_id") == PID:
                             session_id = stream_data.get("session_id")
+                            # Allow the local provider to override the RTSP source URL
+                            # given by the backend. Useful when the provider runs locally
+                            # (connected to the online Render control plane) but reads
+                            # from the local Docker MediaMTX instead of Render's loopback.
+                            rtsp_override = os.getenv("PROVIDER_RTSP_BASE_URL", "").strip().rstrip("/")
+                            if rtsp_override and stream_data.get("source_url"):
+                                orig_parsed = urllib.parse.urlsplit(stream_data["source_url"])
+                                new_parsed = urllib.parse.urlsplit(rtsp_override)
+                                if new_parsed.scheme and new_parsed.netloc:
+                                    stream_data = dict(stream_data)
+                                    # Rebuild: override scheme+host, keep path+query from original
+                                    stream_data["source_url"] = urllib.parse.urlunsplit((
+                                        new_parsed.scheme,
+                                        new_parsed.netloc,
+                                        orig_parsed.path,
+                                        orig_parsed.query,
+                                        "",
+                                    ))
+                                    print(f"[STREAM] RTSP source URL overridden by PROVIDER_RTSP_BASE_URL: {new_parsed.scheme}://{new_parsed.netloc}{orig_parsed.path}")
                             stop_event = threading.Event()
                             with active_streams_lock:
                                 if not active_streams:

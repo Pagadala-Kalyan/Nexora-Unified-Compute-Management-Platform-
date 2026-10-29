@@ -27,6 +27,14 @@ if not defined PROVIDER_SHARED_TOKEN (
     set "PROVIDER_SHARED_TOKEN=local-demo-token"
 )
 
+REM ─── RTSP source override for local Docker MediaMTX ──────────────────────────
+REM When running --online (connected to Render) but MediaMTX is local Docker,
+REM set PROVIDER_RTSP_BASE_URL so the provider reads from local RTSP, not Render's loopback.
+if not defined PROVIDER_RTSP_BASE_URL (
+    set "PROVIDER_RTSP_BASE_URL=rtsp://127.0.0.1:8554"
+    echo [CONFIG] PROVIDER_RTSP_BASE_URL auto-set to rtsp://127.0.0.1:8554 ^(local Docker MediaMTX^)
+)
+
 REM ─── Locate Python ───────────────────────────────────────────────────────────
 set "PYTHON="
 

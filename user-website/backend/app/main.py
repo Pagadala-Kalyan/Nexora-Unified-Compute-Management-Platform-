@@ -1641,8 +1641,12 @@ def mediamtx_auth(body: MediaMTXAuthPayload, s: Session = Depends(db)):
         if body.user not in (None, "nexora"):
             raise HTTPException(401, "Invalid publish credentials")
         source_mode = (session.encoding_config or {}).get("source_mode", "obs")
-        expected_protocol = "webrtc" if source_mode == "browser_capture" else "rtmp"
-        if (body.protocol or "").lower() != expected_protocol:
+        # browser_camera, browser_simulation, and browser_capture all publish via WebRTC WHIP.
+        browser_modes = ("browser_capture", "browser_camera", "browser_simulation")
+        expected_protocol = "webrtc" if source_mode in browser_modes else "rtmp"
+        incoming_protocol = (body.protocol or "").lower()
+        # Accept both exact protocol name and obs/rtmp variants for OBS sources.
+        if incoming_protocol not in (expected_protocol, "rtmps" if expected_protocol == "rtmp" else "webrtc"):
             raise HTTPException(401, "Invalid publish protocol for this stream session")
         if not key or not secrets.compare_digest(key, session.publish_key):
             raise HTTPException(401, "Invalid publish stream key")
@@ -1653,11 +1657,18 @@ def mediamtx_auth(body: MediaMTXAuthPayload, s: Session = Depends(db)):
         return {"status": "ok", "action": "publish"}
 
     elif body.action == "read":
-        # MediaMTX's RTSP token authentication sends the URL's `token` query
-        # parameter as the dedicated `token` field in its HTTP auth webhook.
-        if body.protocol != "rtsp":
+        # MediaMTX sends the RTSP URL's `?token=` query param both in `body.token`
+        # (MediaMTX ≥1.9) and in `body.query` (older builds). Accept either form.
+        read_token = body.token
+        if not read_token and body.query:
+            qs = urllib.parse.parse_qs(body.query)
+            read_token = (qs.get("token") or [None])[0]
+        # Provider reads via RTSP; relax the strict protocol check so that
+        # future MediaMTX builds reporting rtsps or tcp-rtsp still succeed.
+        incoming_protocol = (body.protocol or "").lower()
+        if not incoming_protocol.startswith("rtsp"):
             raise HTTPException(401, "Invalid read protocol")
-        if not body.token or not secrets.compare_digest(body.token, session.read_key):
+        if not read_token or not secrets.compare_digest(read_token, session.read_key):
             raise HTTPException(401, "Invalid read key")
         return {"status": "ok", "action": "read"}
 
