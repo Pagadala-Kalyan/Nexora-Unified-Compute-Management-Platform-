@@ -7,11 +7,10 @@
 api: yes
 apiAddress: 127.0.0.1:9997
 
-# Webhook Authentication. Docker Compose overrides this address with the
-# backend service DNS name; external MediaMTX deployments must use the public
-# HTTPS backend URL.
+# Webhook Authentication. Points to the live Render control plane by default,
+# or http://backend:8000 when running a fully local Docker Compose network.
 authMethod: http
-authHTTPAddress: http://backend:8000/stream/internal/mediamtx/auth
+authHTTPAddress: https://nexora-unified-compute-management.onrender.com/stream/internal/mediamtx/auth
 
 # Ingest & Distribution Protocols
 rtmp: yes
@@ -31,7 +30,7 @@ webrtcLocalUDPAddress: :8189
 # Compose may override these with the Docker host's browser-reachable address
 # and the allowed frontend origins for remote browser capture.
 webrtcAdditionalHosts: [127.0.0.1]
-webrtcAllowOrigins: ["http://localhost:5173", "http://127.0.0.1:5173"]
+webrtcAllowOrigins: ["*"]
 
 hls: no
 
